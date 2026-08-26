@@ -20,8 +20,7 @@ Single-owner UDS bridge between OpenClaw (Miku) and Codex app-server — C' ver.
 systemctl --user enable --now codex-bridge.service
 systemctl --user enable --now telegram-codex-bridge.service
 miku-to-codex "hello"  # → Codex reply on stdout + Telegram + Miku
-echo '{"id":1,"method":"ping"}' | socat - UNIX-CONNECT:/run/user/1000/codex-bridge.sock
-echo '{"id":1,"method":"status"}' | socat - UNIX-CONNECT:/run/user/1000/codex-bridge.sock
+python3 -c "import socket; s=socket.socket(1,1); s.connect('/run/user/1000/codex-bridge.sock'); s.sendall(b'{\"id\":1,\"method\":\"ping\"}\n'); print(s.recv(4096).decode())"
 ```
 
 ## State
@@ -29,6 +28,13 @@ echo '{"id":1,"method":"status"}' | socat - UNIX-CONNECT:/run/user/1000/codex-br
 - `~/.local/state/codex-bridge/thread-state.json` — `activeThreadId`
 - `~/.local/state/codex-bridge/offset.json` — `pendingReplies` / `delivered` dedup
 - `~/.local/state/codex-telegram-bridge/state.json` — reader `processed_ids` (polling offset)
+
+## Tests
+
+```sh
+python3 tests/test_thread_store.py   # unit: ThreadStore rotation
+bash tests/test_bridge.sh            # smoke: daemon ping/status via UDS
+```
 
 ## E2E
 
@@ -41,3 +47,4 @@ systemError (16384 items)       → ThreadStore picks fresh small thread
 ## Status
 
 C' ver.2 implemented 2026-08-26 — replaces `019fc308`/`01a03ec6` (systemError chain) with fresh `01a03f04-e1aa-7af0-8d7e-84d963cf03bf`.
+Fanout cgroup fix (timeout 45s) + tests added 2026-08-26 17:10.

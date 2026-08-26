@@ -111,13 +111,31 @@ def deliver_miku_async(text: str) -> None:
     if not text:
         return
     try:
-        subprocess.Popen(
-            [sys.executable, "-c", f"""
-import subprocess, sys
-subprocess.run([{repr(str(OPENCLAW_BIN))}, "agent", "--session-key", {repr(MIKU_SESSION_KEY)}, "--deliver", "--reply-channel", "telegram", "--reply-to", {repr(TELEGRAM_TARGET)}, "--thinking", "off", "--timeout", "60", "--message", {repr("Codex: "+text)}], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=90)
-"""],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-        )
+        cmd = [str(OPENCLAW_BIN), "agent", "--session-key", MIKU_SESSION_KEY, "--deliver",
+               "--reply-channel", "telegram", "--reply-to", TELEGRAM_TARGET,
+               "--thinking", "off", "--timeout", "60", "--message", f"Codex: {text}"]
+        try:
+            subprocess.Popen(
+                ["timeout", "45"] + cmd,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except FileNotFoundError:
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            def _kill():
+                import time as _t
+                _t.sleep(50)
+                try:
+                    proc.terminate()
+                    _t.sleep(2)
+                    proc.kill()
+                except Exception:
+                    pass
+            import threading
+            threading.Thread(target=_kill, daemon=True).start()
     except Exception:
         pass
 
