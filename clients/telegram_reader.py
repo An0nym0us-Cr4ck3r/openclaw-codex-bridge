@@ -263,12 +263,18 @@ def main() -> int:
     _fb_rid = state.get("frozen_batch_request_id")
     _fb_sid = state.get("frozen_batch_session_id")
     if isinstance(_fb, list) and isinstance(_fb_ids, list) and isinstance(_fb_rid, str) and _fb and _fb_ids and _fb_rid:
-        # Session-bound guard: reject stale batch from a different session.
-        # Back-compat: state written before this PR has no frozen_batch_session_id;
-        # treat missing guard as legacy — validate via requestId fingerprint
-        # only if current session_id is None (cannot compare), otherwise
-        # require explicit match.
-        if _fb_sid is not None and _fb_sid != session_id:
+        # Session-bound guard: reject stale batch from a different session or
+        # from legacy state that lacked frozen_batch_session_id.  Without the
+        # session guard we cannot prove the batch belongs to the current
+        # session, so discarding is the safe default (prevents replaying an
+        # old batch into a new session after a session switch).
+        _has_session_guard = "frozen_batch_session_id" in state
+        if not _has_session_guard:
+            log("discarding frozen batch: legacy state without frozen_batch_session_id")
+            pending_user_batch = None
+            pending_user_batch_ids = None
+            pending_user_batch_request_id = None
+        elif _fb_sid != session_id:
             log(f"discarding frozen batch: session mismatch {str(_fb_sid)[:16]}.. != {str(session_id)[:16]}..")
             pending_user_batch = None
             pending_user_batch_ids = None

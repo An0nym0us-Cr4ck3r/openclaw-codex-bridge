@@ -161,6 +161,7 @@ class Daemon:
         self._fanout_event = asyncio.Event()
         self._ws_connected = False
         self._stale_task: asyncio.Task[None] | None = None
+        self._active_request_ids: set[str] = set()
 
     async def ensure_ws(self) -> None:
         backoff = 1.0
@@ -422,22 +423,48 @@ class Daemon:
         )
         return result
 
+    def _is_turn_active(self) -> bool:
+        """True while a Codex turn is certainly still running.
+
+        Only two signals are reliable here: the worker queue is non-empty and
+        the worker is holding an id in ``_active_request_ids``.  A
+        lastAttemptAt timestamp alone is not a live heartbeat, so it is not
+        used to keep entries alive — otherwise a crash without cleanup would
+        keep a dead entry for an hour.  Deceased entries are reaped by TTL;
+        live ones are protected by the two active signals above and by
+        deferring the whole sweep while a turn is active.
+        """
+
+        return bool(self._active_request_ids or self.queue.qsize() > 0)
+
+    def _reap_with_active_guard(self) -> list[str]:
+        """Reap stale entries, skipping any requestId whose turn is live.
+
+        The long-turn bug is that ``OffsetStore._is_stale_in_progress`` uses
+        only a 600 s TTL without a live heartbeat, so the watchdog must not
+        call it.  The fix requested is: if a Codex turn is certainly active
+        (``_active_request_ids`` or queue), defer the entire sweep; otherwise
+        it is safe to use the TTL-based reap because no turn is running.
+        """
+
+        if self._is_turn_active():
+            log("stale watchdog deferred: active turn in progress")
+            return []
+        return self.offset.reap_stale_requests()
+
     async def stale_watchdog(self) -> None:
         """Periodically reap ``in_progress`` requests that never finished."""
 
         # First sweep shortly after boot to surface the 17:33 stale entry that
         # is still live as of this PR.  Afterwards sweep every five minutes.
-        # Known limitation: the 600 s STALE_REQUEST_TTL has no live heartbeat,
-        # so an active Codex turn running longer than 600 s could be
-        # misclassified as stale.  Avoid reaping while a turn is active by
-        # skipping the sweep when any request is being awaited (see
-        # OffsetStore._is_stale_in_progress docstring).  The underlying
-        # OffsetStore check is intentionally a soft bound; operators should
-        # prefer long-turn idempotency at the caller over tightening this TTL.
+        # Guard: if a long turn (>600 s) is still active, defer the sweep so
+        # an in-flight turn is not misclassified as stale and reaped.  The
+        # TTL-based OffsetStore check alone has no live heartbeat, so the
+        # watchdog explicitly checks _is_turn_active() before reaping.
         await asyncio.sleep(10)
         while True:
             try:
-                reaped = self.offset.reap_stale_requests()
+                reaped = self._reap_with_active_guard()
                 for rid in reaped:
                     self.verification.append("request.stale_reaped", requestKey=request_key(rid), reason="watchdog")
                     log(f"stale reaped {request_key(rid)} (watchdog)")
@@ -538,7 +565,11 @@ class Daemon:
                     if not text.strip():
                         fut.set_result({"error": {"code": -32602, "message": "text required"}})
                     else:
-                        res = await self.handle_submit(text, source, request_id)
+                        self._active_request_ids.add(request_id)
+                        try:
+                            res = await self.handle_submit(text, source, request_id)
+                        finally:
+                            self._active_request_ids.discard(request_id)
                         fut.set_result({"result": res})
                 elif method == "status":
                     fut.set_result({"result": await self.status_info()})
