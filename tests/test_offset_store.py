@@ -69,10 +69,46 @@ def test_legacy_pending_migration() -> None:
         assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
 
 
+def test_stale_in_progress_reap() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "offset.json"
+        store = OffsetStore(path)
+        fingerprint = request_fingerprint("miku", "stuck")
+        assert store.begin_request("req-stale", fingerprint) is None
+        # Simulate a crash leaving the request in_progress without a reply.
+        stale_created = time.time() - 700
+        store.data["requests"]["req-stale"]["createdAt"] = stale_created
+        store.data["requests"]["req-stale"]["lastAttemptAt"] = stale_created
+        store.save()
+        # Reload simulates the next daemon boot; begin_request must reap and allow a retry.
+        reloaded = OffsetStore(path)
+        assert reloaded.begin_request("req-stale", fingerprint) is None
+        assert reloaded.data["requests"]["req-stale"]["attempts"] == 1
+        assert reloaded.data["requests"]["req-stale"]["createdAt"] > stale_created
+        # The watchdog also reaps when left idle.
+        reloaded.data["requests"]["req-stale"]["lastAttemptAt"] = time.time() - 700
+        reloaded.data["requests"]["req-stale"]["createdAt"] = time.time() - 700
+        reloaded.save()
+        reaped = OffsetStore(path).reap_stale_requests()
+        assert "req-stale" in reaped
+        empty = OffsetStore(path)
+        assert "req-stale" not in empty.data.get("requests", {})
+        # Completed entries are never reaped.
+        done_store = OffsetStore(Path(directory) / "done.json")
+        fp2 = request_fingerprint("miku", "done")
+        done_store.begin_request("req-done", fp2)
+        done_store.finish_request("req-done", fp2, {"reply": "ok", "threadId": "t", "turnId": "u"})
+        done_store.data["requests"]["req-done"]["updatedAt"] = time.time() - 9999
+        done_store.save()
+        assert OffsetStore(Path(directory) / "done.json").reap_stale_requests() == []
+        assert "req-done" in OffsetStore(Path(directory) / "done.json").data["requests"]
+
+
 def main() -> None:
     test_restart_idempotency_and_outbox()
     test_retry_backoff_and_conflict()
     test_legacy_pending_migration()
+    test_stale_in_progress_reap()
     print("PASS offset_store")
 
 

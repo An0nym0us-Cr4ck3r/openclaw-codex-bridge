@@ -160,6 +160,7 @@ class Daemon:
         self._fanout_task: asyncio.Task[None] | None = None
         self._fanout_event = asyncio.Event()
         self._ws_connected = False
+        self._stale_task: asyncio.Task[None] | None = None
 
     async def ensure_ws(self) -> None:
         backoff = 1.0
@@ -350,7 +351,23 @@ class Daemon:
         await self.ensure_ws()
 
     async def handle_submit(self, text: str, source: str, request_id: str) -> dict[str, Any]:
+        # Opportunistically reap a stale ``in_progress`` entry for this id so
+        # an old crash (e.g. daemon restart mid-turn at ~17:33) does not pin
+        # the slot forever.  ``begin_request`` already reaps the same id, but
+        # we emit an operator-visible verification event here so
+        # ``bridge_report`` reflects that reaping happened.
+        try:
+            existing = (self.offset.data.get("requests") or {}).get(request_id)
+            if isinstance(existing, dict):
+                # ``_is_stale_in_progress`` is static; call through the store.
+                from offset_store import OffsetStore as _OS  # local to avoid cycle at import time
+                if _OS._is_stale_in_progress(existing, time.time()):  # type: ignore[attr-defined]
+                    self.verification.append("request.stale_reaped", requestKey=request_key(request_id), ageSec=round(time.time() - float(existing.get("lastAttemptAt", existing.get("createdAt", time.time()))), 1))
+        except Exception:
+            pass
         fingerprint = request_fingerprint(source, text)
+        # ``begin_request`` reaps the stale entry for this id if present; the
+        # event above records that it happened.
         cached = self.offset.begin_request(request_id, fingerprint)
         if cached is not None:
             self.verification.append("request.replayed", requestKey=request_key(request_id))
@@ -404,6 +421,22 @@ class Daemon:
             replyLength=len(reply),
         )
         return result
+
+    async def stale_watchdog(self) -> None:
+        """Periodically reap ``in_progress`` requests that never finished."""
+
+        # First sweep shortly after boot to surface the 17:33 stale entry that
+        # is still live as of this PR.  Afterwards sweep every five minutes.
+        await asyncio.sleep(10)
+        while True:
+            try:
+                reaped = self.offset.reap_stale_requests()
+                for rid in reaped:
+                    self.verification.append("request.stale_reaped", requestKey=request_key(rid), reason="watchdog")
+                    log(f"stale reaped {request_key(rid)} (watchdog)")
+            except Exception as e:
+                log(f"stale watchdog error: {e}")
+            await asyncio.sleep(300)
 
     async def fanout_worker(self) -> None:
         """Drain the durable outbox and retry each target independently."""
@@ -586,6 +619,7 @@ class Daemon:
                     pass
         self.uds.parent.mkdir(parents=True, exist_ok=True)
         self._fanout_task = asyncio.create_task(self.fanout_worker())
+        self._stale_task = asyncio.create_task(self.stale_watchdog())
         await self.ensure_ws()
         self._worker_task = asyncio.create_task(self.worker())
         self._server = await asyncio.start_unix_server(self.handle_client, path=str(self.uds))
