@@ -191,9 +191,25 @@ def load_state() -> dict[str, Any]:
         return {"bootstrap_done": False, "processed_ids": [], "session_id": None}
 
 
-def save_state(bootstrap_done: bool, processed: set[str], session_id: str | None) -> None:
+def save_state(
+    bootstrap_done: bool,
+    processed: set[str],
+    session_id: str | None,
+    frozen_batch: list[tuple[str, str]] | None = None,
+    frozen_batch_ids: list[str] | None = None,
+    frozen_batch_request_id: str | None = None,
+) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"bootstrap_done": bootstrap_done, "processed_ids": sorted(processed)[-5000:], "session_id": session_id}
+    payload: dict[str, Any] = {"bootstrap_done": bootstrap_done, "processed_ids": sorted(processed)[-5000:], "session_id": session_id}
+    # Persist in-flight frozen batch so a crash between UDS success and
+    # processed_ids save does not cause the old User entries to be split
+    # into a new requestId and double-submitted on restart.
+    if frozen_batch is not None:
+        payload["frozen_batch"] = frozen_batch
+    if frozen_batch_ids is not None:
+        payload["frozen_batch_ids"] = frozen_batch_ids
+    if frozen_batch_request_id is not None:
+        payload["frozen_batch_request_id"] = frozen_batch_request_id
     fd, tmp_name = tempfile.mkstemp(prefix=f".{STATE_PATH.name}.", suffix=".tmp", dir=STATE_PATH.parent)
     tmp = Path(tmp_name)
     try:
@@ -231,9 +247,29 @@ def main() -> int:
     pending_user_ids: set[str] = set()
     bootstrap_queued = False
     stop_requested = False
-    pending_user_batch: list[tuple[str, str]] | None = None
-    pending_user_batch_ids: list[str] | None = None
-    pending_user_batch_request_id: str | None = None
+    # Restore frozen batch persisted before a crash (P1 fix).  If previous
+    # run froze a batch but stopped before processed_ids was updated, the
+    # same requestId must be retried instead of splitting old+new Users.
+    _fb = state.get("frozen_batch")
+    _fb_ids = state.get("frozen_batch_ids")
+    _fb_rid = state.get("frozen_batch_request_id")
+    if isinstance(_fb, list) and isinstance(_fb_ids, list) and isinstance(_fb_rid, str) and _fb and _fb_ids and _fb_rid:
+        try:
+            pending_user_batch: list[tuple[str, str]] | None = [(str(a), str(b)) for a, b in _fb if isinstance(a, str) and isinstance(b, str)]
+            pending_user_batch_ids: list[str] | None = [str(x) for x in _fb_ids if isinstance(x, str)]
+            pending_user_batch_request_id: str | None = _fb_rid
+            if not pending_user_batch or not pending_user_batch_ids:
+                raise ValueError("empty frozen batch")
+            log(f"restored frozen batch {len(pending_user_batch)} entries requestId={_fb_rid[:16]}...")
+        except Exception as e:
+            log(f"frozen batch restore failed: {e}")
+            pending_user_batch = None
+            pending_user_batch_ids = None
+            pending_user_batch_request_id = None
+    else:
+        pending_user_batch = None
+        pending_user_batch_ids = None
+        pending_user_batch_request_id = None
 
     while not stop_requested:
         try:
@@ -300,8 +336,6 @@ def main() -> int:
 
             def flush_users() -> bool:
                 nonlocal pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id
-                # batch vars are now outer-scope (hoisted above while) so a
-                # failed UDS send keeps the frozen batch across poll cycles
                 if not pending_users and pending_user_batch is None:
                     return True
                 if pending_user_batch is None:
@@ -309,44 +343,50 @@ def main() -> int:
                     pending_user_batch_ids = [rid for rid, _ in pending_user_batch]
                     text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(t for _, t in pending_user_batch)
                     pending_user_batch_request_id = stable_request_id("telegram", session_id, pending_user_batch_ids, text)
-                    # Freeze the in-flight batch: clear the live collector so
-                    # new Users arriving during a UDS failure don't mutate the
-                    # retried requestId (274-301 double-submit bug).
                     pending_users.clear()
                     pending_user_ids.clear()
+                    # Persist frozen batch before UDS so a crash between
+                    # UDS success and processed_ids update can be recovered
+                    # with the same requestId (P1 fix).
+                    save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id)
                 assert pending_user_batch is not None and pending_user_batch_ids is not None and pending_user_batch_request_id is not None
                 batch_text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(t for _, t in pending_user_batch)
                 if uds_submit(batch_text, "telegram", request_id=pending_user_batch_request_id) is None:
                     return False
                 processed.update(pending_user_batch_ids)
+                # Clear persisted frozen batch after success
                 pending_user_batch = None
                 pending_user_batch_ids = None
                 pending_user_batch_request_id = None
+                save_state(bootstrap_done, processed, session_id, None, None, None)
+                # Re-save without frozen keys: explicitly overwrite with no frozen fields
+                # (save_state omits None frozen keys, so the previous file's frozen keys are removed on replace)
                 return True
 
             # flush to daemon via UDS (queue serializes; no flock needed)
             if not bootstrap_done and pending_context:
                 if flush_context() and not pending_context:
                     bootstrap_done = True
-                    save_state(bootstrap_done, processed, session_id)
+                    save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id)
                     log("Telegram backlog submitted via UDS")
                 else:
                     time.sleep(5)
                     continue
             elif pending_users or pending_user_batch is not None:
-                # send context first if any
                 if not flush_context():
                     time.sleep(5)
                     continue
                 if not flush_users():
                     time.sleep(5)
                     continue
-                save_state(bootstrap_done, processed, session_id)
+                # flush_users already persisted cleared frozen state; remaining
+                # save covers any context flush that happened above
+                save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id)
             elif pending_context:
                 if flush_context() and not pending_context:
-                    save_state(bootstrap_done, processed, session_id)
+                    save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id)
             else:
-                save_state(bootstrap_done, processed, session_id)
+                save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id)
         except Exception as e:
             log(f"bridge retry: {type(e).__name__}: {e}")
             time.sleep(5)

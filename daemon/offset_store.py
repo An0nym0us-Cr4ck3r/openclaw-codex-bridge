@@ -244,15 +244,25 @@ class OffsetStore:
         requests = self.data.get("requests")
         if not isinstance(requests, dict) or len(requests) <= MAX_REQUESTS:
             return False
+        # Never evict a completed request whose delivery is still in the
+        # outbox (pendingReplies).  Trimming it would cause a fanout retry to
+        # allocate a new deliveryId and a duplicate Codex turn.
+        pending_request_ids: set[str] = set()
+        for item in self.data.get("pendingReplies") or []:
+            if isinstance(item, dict) and isinstance(item.get("requestId"), str):
+                pending_request_ids.add(item["requestId"])
         completed = [
             (key, value)
             for key, value in requests.items()
-            if isinstance(value, dict) and value.get("status") == "completed"
+            if isinstance(value, dict) and value.get("status") == "completed" and key not in pending_request_ids
         ]
         completed.sort(key=lambda pair: float(pair[1].get("updatedAt", 0)))
         drop = max(0, len(requests) - MAX_REQUESTS)
+        # Only evict as many as are actually evictable; do not fall through
+        # to pending entries when pendingReplies pins the history.
+        evictable = min(drop, len(completed))
         changed = False
-        for key, _ in completed[:drop]:
+        for key, _ in completed[:evictable]:
             requests.pop(key, None)
             changed = True
         return changed
@@ -400,6 +410,7 @@ class OffsetStore:
             "result": stored_result,
         }
         self.save()
+        self.maybe_trim()
         return delivery_id
 
     def enqueue_reply(self, reply: str, thread_id: str, turn_id: str, request_id: str) -> str:
