@@ -28,6 +28,16 @@ SCHEMA_VERSION = 2
 MAX_REQUESTS = 5000
 MAX_COMPLETED_DELIVERIES = 5000
 MAX_LEGACY_HASHES = 2000
+# Responses that stayed ``in_progress`` without ever reaching ``finish_request``
+# typically mean the daemon stopped mid-turn (crash or restart).  Keeping them
+# forever would let a single crash permanently inflate ``inProgressRequests``
+# and block ``MAX_REQUESTS`` eviction of older completed entries.  The daemon
+# reaps entries that have not been retried for this many seconds; a retry
+# with the same ``requestId`` after that window is treated as a fresh attempt
+# rather than a duplicate.  Ten minutes is long enough to avoid racing a slow
+# Codex turn (which usually finishes well inside the daemon's 30 min UDS
+# timeout) while still bounding cold restart accumulation.
+STALE_REQUEST_TTL = 600.0
 
 
 class RequestConflict(ValueError):
@@ -263,6 +273,37 @@ class OffsetStore:
             raise RequestConflict(f"request id already used for different input: {request_key(request_id)}")
         return entry
 
+    @staticmethod
+    def _is_stale_in_progress(entry: dict[str, Any], now: float, ttl: float = STALE_REQUEST_TTL) -> bool:
+        if entry.get("status") != "in_progress":
+            return False
+        try:
+            last = float(entry.get("lastAttemptAt", entry.get("createdAt", now)))
+        except (TypeError, ValueError):
+            return True
+        return (now - last) > ttl
+
+    def reap_stale_requests(self, now: float | None = None, ttl: float | None = None) -> list[str]:
+        """Remove ``in_progress`` entries older than ``ttl``.
+
+        Returns the list of request ids that were removed so the caller can
+        emit a verification event.  Completed entries are never reaped here.
+        """
+
+        current = time.time() if now is None else now
+        threshold = STALE_REQUEST_TTL if ttl is None else ttl
+        requests = self.data.get("requests") or {}
+        stale = [
+            key
+            for key, value in list(requests.items())
+            if isinstance(value, dict) and self._is_stale_in_progress(value, current, threshold)
+        ]
+        if stale:
+            for key in stale:
+                requests.pop(key, None)
+            self.save()
+        return stale
+
     def begin_request(self, request_id: str, fingerprint: str) -> dict[str, Any] | None:
         """Record an attempt, returning a durable completed result if present."""
 
@@ -271,7 +312,22 @@ class OffsetStore:
         if entry is not None and entry.get("status") == "completed":
             result = entry.get("result")
             return copy.deepcopy(result) if isinstance(result, dict) else None
-
+        # A previous daemon instance may have crashed between ``begin`` and
+        # ``finish`` leaving an ``in_progress`` entry that will otherwise sit
+        # forever (the 17:33 restart produced exactly this).  Opportunistically
+        # reap stale entries before deciding whether this is a fresh attempt.
+        # Reaping here is in addition to the periodic daemon task so offline
+        # soak recovery and unit tests also behave correctly.
+        if entry is not None and self._is_stale_in_progress(entry, time.time()):
+            try:
+                old = dict(entry)
+            except Exception:
+                old = {}
+            requests.pop(request_id, None)
+            entry = None
+            # ``save`` happens below; keep the stale payload available for the
+            # daemon layer if it wants to emit a verification event.
+            # ``entry`` is now None; a fresh one is created below and ``save`` persists.
         now = time.time()
         if entry is None:
             entry = {
