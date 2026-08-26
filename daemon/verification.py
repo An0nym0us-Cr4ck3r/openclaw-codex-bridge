@@ -35,7 +35,10 @@ class VerificationLog:
                 os.fchmod(fd, 0o600)
                 payload = (line + "\n").encode("utf-8")
                 while payload:
-                    payload = payload[os.write(fd, payload):]
+                    written = os.write(fd, payload)
+                    if written <= 0:
+                        raise OSError("verification log write made no progress")
+                    payload = payload[written:]
                 os.fsync(fd)
             finally:
                 os.close(fd)
