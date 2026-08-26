@@ -51,13 +51,18 @@ def run(count: int, crash_every: int) -> None:
 
         assert store.pending_replies(now=10**12) == []
         summary = store.summary()
-        # Ledger is bounded by MAX_REQUESTS; when count exceeds it, oldest
-        # completed entries are evicted (see daemon/offset_store.py).
+        # Ledger and delivery history are both bounded (MAX_REQUESTS /
+        # MAX_COMPLETED_DELIVERIES are both 5000; see daemon/offset_store.py).
+        from offset_store import MAX_COMPLETED_DELIVERIES
+
         expected_requests = min(count, MAX_REQUESTS)
+        expected_deliveries = min(count, MAX_COMPLETED_DELIVERIES)
         assert summary["completedRequests"] == expected_requests, (
             f"expected {expected_requests} completedRequests, got {summary['completedRequests']}"
         )
-        assert summary["completedDeliveries"] == count
+        assert summary["completedDeliveries"] == expected_deliveries, (
+            f"expected {expected_deliveries} completedDeliveries, got {summary['completedDeliveries']}"
+        )
         # When trimmed, pending must still be 0 (no loss, just history eviction).
         assert summary["pendingReplies"] == 0
         print(f"PASS soak_bridge count={count} crash_every={crash_every}")

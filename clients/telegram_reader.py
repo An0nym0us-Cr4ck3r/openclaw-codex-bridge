@@ -247,6 +247,9 @@ def main() -> int:
                 pending_context_ids.clear()
                 pending_users.clear()
                 pending_user_ids.clear()
+                pending_user_batch = None
+                pending_user_batch_ids = None
+                pending_user_batch_request_id = None
             records = read_records()
             new_records: list[dict[str, Any]] = []
             for r in records:
@@ -268,7 +271,7 @@ def main() -> int:
             else:
                 for r in new_records:
                     rid = r["_rid"]
-                    if rid in pending_context_ids or rid in pending_user_ids:
+                    if rid in pending_context_ids or rid in pending_user_ids or (pending_user_batch_ids is not None and rid in pending_user_batch_ids):
                         continue
                     lab = label_record(r)
                     if lab is None:
@@ -330,7 +333,7 @@ def main() -> int:
                 else:
                     time.sleep(5)
                     continue
-            elif pending_users:
+            elif pending_users or pending_user_batch is not None:
                 # send context first if any
                 if not flush_context():
                     time.sleep(5)
