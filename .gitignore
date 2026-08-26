@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+*.sock
+local/
+thread-state.json
