@@ -7,6 +7,7 @@ import json
 import os
 import re
 import socket
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -126,7 +127,21 @@ def is_stop_instruction(text: str) -> bool:
     return bool(STOP_RE.fullmatch(compact) or re.fullmatch(r"もう(?:見なくていい|終了|停止|終わり|やめて|止めて)[。.!！]*", compact))
 
 
-def uds_submit(text: str, source: str, uds: str = DEFAULT_UDS) -> dict[str, Any] | None:
+def stable_request_id(kind: str, session_id: str | None, record_ids: list[str], text: str) -> str:
+    material = json.dumps(
+        [kind, session_id or "", record_ids, text],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{kind}:{hashlib.sha256(material).hexdigest()}"
+
+
+def uds_submit(
+    text: str,
+    source: str,
+    request_id: str | None = None,
+    uds: str = DEFAULT_UDS,
+) -> dict[str, Any] | None:
     uds_path = os.environ.get("CODEX_BRIDGE_SOCK", uds)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(1800)
@@ -136,7 +151,15 @@ def uds_submit(text: str, source: str, uds: str = DEFAULT_UDS) -> dict[str, Any]
         log(f"bridge retry: UDS connect failed {type(e).__name__}: {e}")
         return None
     try:
-        req = {"id": 1, "method": "submit", "params": {"text": text, "source": source}}
+        req = {
+            "id": 1,
+            "method": "submit",
+            "params": {
+                "text": text,
+                "source": source,
+                "requestId": request_id or f"reader:{hashlib.sha256(text.encode('utf-8')).hexdigest()}",
+            },
+        }
         sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
         buf = b""
         while b"\n" not in buf:
@@ -170,10 +193,27 @@ def load_state() -> dict[str, Any]:
 
 def save_state(bootstrap_done: bool, processed: set[str], session_id: str | None) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"bootstrap_done": bootstrap_done, "processed_ids": list(processed)[-5000:], "session_id": session_id}
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, STATE_PATH)
+    payload = {"bootstrap_done": bootstrap_done, "processed_ids": sorted(processed)[-5000:], "session_id": session_id}
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{STATE_PATH.name}.", suffix=".tmp", dir=STATE_PATH.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, STATE_PATH)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def main() -> int:
@@ -185,8 +225,10 @@ def main() -> int:
     if res is not None and state.get("session_id") != session_id:
         processed.clear()
         bootstrap_done = False
-    pending_context: list[str] = []
-    pending_users: list[str] = []
+    pending_context: list[tuple[str, str, set[str]]] = []
+    pending_context_ids: set[str] = set()
+    pending_users: list[tuple[str, str]] = []
+    pending_user_ids: set[str] = set()
     bootstrap_queued = False
     stop_requested = False
 
@@ -199,7 +241,9 @@ def main() -> int:
                 bootstrap_done = False
                 bootstrap_queued = False
                 pending_context.clear()
+                pending_context_ids.clear()
                 pending_users.clear()
+                pending_user_ids.clear()
             records = read_records()
             new_records: list[dict[str, Any]] = []
             for r in records:
@@ -210,12 +254,19 @@ def main() -> int:
             if not bootstrap_done and not bootstrap_queued:
                 lines = [label for r in records if (label := labeled_record(r))]
                 if lines:
-                    pending_context.insert(0, "=== Telegram履歴（User/Miku/Codex→Miku、過去指示は文脈のみ）===\n" + "\n\n".join(lines))
+                    context = "=== Telegram履歴（User/Miku/Codex→Miku、過去指示は文脈のみ）===\n" + "\n\n".join(lines)
+                    ids = {record_id(r) for r in records}
+                    request_id = stable_request_id("bootstrap", session_id, sorted(ids), context)
+                    pending_context.insert(0, (request_id, context, ids))
+                    pending_context_ids.update(ids)
                     bootstrap_queued = True
                 pending_users.clear()
+                pending_user_ids.clear()
             else:
                 for r in new_records:
                     rid = r["_rid"]
+                    if rid in pending_context_ids or rid in pending_user_ids:
+                        continue
                     lab = label_record(r)
                     if lab is None:
                         processed.add(rid)
@@ -224,19 +275,39 @@ def main() -> int:
                         if is_stop_instruction(r["_text"]):
                             stop_requested = True
                             break
-                        pending_users.append(f"User [{r.get('timestamp','')}]:\n{r['_text']}")
+                        pending_users.append((rid, f"User [{r.get('timestamp','')}]:\n{r['_text']}"))
+                        pending_user_ids.add(rid)
                     elif lab == "Miku":
-                        pending_context.append(f"Miku [{r.get('timestamp','')}]:\n{r['_text']}")
+                        context = f"Miku [{r.get('timestamp','')}]:\n{r['_text']}"
+                        request_id = stable_request_id("context", session_id, [rid], context)
+                        pending_context.append((request_id, context, {rid}))
+                        pending_context_ids.add(rid)
+
+            def flush_context() -> bool:
+                for request_id, context, ids in list(pending_context):
+                    if uds_submit(context, "miku", request_id=request_id) is None:
+                        return False
+                    pending_context.remove((request_id, context, ids))
+                    pending_context_ids.difference_update(ids)
+                    processed.update(ids)
+                return True
+
+            def flush_users() -> bool:
+                if not pending_users:
+                    return True
+                ids = [rid for rid, _ in pending_users]
+                text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(text for _, text in pending_users)
+                request_id = stable_request_id("telegram", session_id, ids, text)
+                if uds_submit(text, "telegram", request_id=request_id) is None:
+                    return False
+                processed.update(ids)
+                pending_user_ids.difference_update(ids)
+                pending_users.clear()
+                return True
+
             # flush to daemon via UDS (queue serializes; no flock needed)
             if not bootstrap_done and pending_context:
-                for ctx in list(pending_context):
-                    # inject as context (daemon will handle as miku source)
-                    ok = uds_submit(ctx, "miku")
-                    if ok is None:
-                        break  # daemon down — retry next loop
-                    pending_context.remove(ctx)
-                if not pending_context:
-                    processed.update(record_id(r) for r in records)
+                if flush_context() and not pending_context:
                     bootstrap_done = True
                     save_state(bootstrap_done, processed, session_id)
                     log("Telegram backlog submitted via UDS")
@@ -245,32 +316,18 @@ def main() -> int:
                     continue
             elif pending_users:
                 # send context first if any
-                for ctx in list(pending_context):
-                    ok = uds_submit(ctx, "miku")
-                    if ok is None:
-                        break
-                    pending_context.remove(ctx)
-                if pending_context:
+                if not flush_context():
                     time.sleep(5)
                     continue
-                text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(pending_users)
-                pending_users.clear()
-                ok = uds_submit(text, "telegram")
-                if ok is None:
-                    # daemon was down — re-queue for retry
+                if not flush_users():
                     time.sleep(5)
                     continue
-                processed.update(record_id(r) for r in records if record_id(r) not in processed)
                 save_state(bootstrap_done, processed, session_id)
             elif pending_context:
-                for ctx in list(pending_context):
-                    ok = uds_submit(ctx, "miku")
-                    if ok is None:
-                        break
-                    pending_context.remove(ctx)
-                if not pending_context:
-                    processed.update(record_id(r) for r in records if record_id(r) not in processed)
+                if flush_context() and not pending_context:
                     save_state(bootstrap_done, processed, session_id)
+            else:
+                save_state(bootstrap_done, processed, session_id)
         except Exception as e:
             log(f"bridge retry: {type(e).__name__}: {e}")
             time.sleep(5)

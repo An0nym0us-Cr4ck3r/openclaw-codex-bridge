@@ -6,7 +6,7 @@ Wants=codex-remote-control.service
 [Service]
 Type=simple
 WorkingDirectory=/opt/openclaw/workspaces/miku/openclaw-codex-bridge
-ExecStart=/usr/bin/python3 /opt/openclaw/workspaces/miku/openclaw-codex-bridge/daemon/daemon.py --uds /run/user/1000/codex-bridge.sock --state /home/s0u7a/.local/state/codex-bridge/thread-state.json --offset /home/s0u7a/.local/state/codex-bridge/offset.json
+ExecStart=/usr/bin/python3 /opt/openclaw/workspaces/miku/openclaw-codex-bridge/daemon/daemon.py --uds /run/user/1000/codex-bridge.sock --state /home/s0u7a/.local/state/codex-bridge/thread-state.json --offset /home/s0u7a/.local/state/codex-bridge/offset.json --verification-log /home/s0u7a/.local/state/codex-bridge/verification.jsonl
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1

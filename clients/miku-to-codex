@@ -6,6 +6,7 @@ import json
 import os
 import socket
 import sys
+import uuid
 from pathlib import Path
 
 DEFAULT_UDS = "/run/user/1000/codex-bridge.sock"
@@ -24,7 +25,12 @@ def main() -> int:
     except (FileNotFoundError, ConnectionRefusedError, OSError) as e:
         print(f"codex-bridge.sock not found — is daemon running? ({e})", file=sys.stderr)
         return 3
-    req = {"id": 1, "method": "submit", "params": {"text": text, "source": "miku"}}
+    request_id = os.environ.get("CODEX_REQUEST_ID") or f"miku:{uuid.uuid4().hex}"
+    req = {
+        "id": 1,
+        "method": "submit",
+        "params": {"text": text, "source": "miku", "requestId": request_id},
+    }
     sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
     # read one JSON line
     buf = b""
