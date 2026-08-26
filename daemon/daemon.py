@@ -383,6 +383,7 @@ class Daemon:
             reply, turn_id = await self.ws.run_turn(tid, payload)
         result = {"reply": reply, "threadId": tid, "turnId": turn_id}
         delivery_id = self.offset.finish_request(request_id, fingerprint, result)
+        self.offset.maybe_trim()
         if delivery_id:
             result["deliveryId"] = delivery_id
             self.verification.append(

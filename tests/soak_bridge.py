@@ -14,6 +14,8 @@ from offset_store import OffsetStore, request_fingerprint
 def run(count: int, crash_every: int) -> None:
     if count < 1 or crash_every < 1:
         raise ValueError("count and crash-every must be positive")
+    from offset_store import MAX_REQUESTS
+
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "offset.json"
         store = OffsetStore(path)
@@ -49,8 +51,15 @@ def run(count: int, crash_every: int) -> None:
 
         assert store.pending_replies(now=10**12) == []
         summary = store.summary()
-        assert summary["completedRequests"] == count
+        # Ledger is bounded by MAX_REQUESTS; when count exceeds it, oldest
+        # completed entries are evicted (see daemon/offset_store.py).
+        expected_requests = min(count, MAX_REQUESTS)
+        assert summary["completedRequests"] == expected_requests, (
+            f"expected {expected_requests} completedRequests, got {summary['completedRequests']}"
+        )
         assert summary["completedDeliveries"] == count
+        # When trimmed, pending must still be 0 (no loss, just history eviction).
+        assert summary["pendingReplies"] == 0
         print(f"PASS soak_bridge count={count} crash_every={crash_every}")
 
 

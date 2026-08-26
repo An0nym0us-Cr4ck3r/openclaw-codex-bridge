@@ -219,17 +219,7 @@ class OffsetStore:
 
         # Keep the new ledger bounded.  Completed request entries are retained
         # for retries; in-progress entries are never discarded automatically.
-        requests = self.data["requests"]
-        if len(requests) > MAX_REQUESTS:
-            completed = [
-                (key, value)
-                for key, value in requests.items()
-                if isinstance(value, dict) and value.get("status") == "completed"
-            ]
-            completed.sort(key=lambda pair: float(pair[1].get("updatedAt", 0)))
-            for key, _ in completed[: max(0, len(requests) - MAX_REQUESTS)]:
-                requests.pop(key, None)
-                changed = True
+        changed = self._trim_requests() or changed
 
         completed_ids = [str(value) for value in self.data["completedDeliveries"] if value]
         if len(completed_ids) > MAX_COMPLETED_DELIVERIES:
@@ -239,6 +229,31 @@ class OffsetStore:
             self.data["completedDeliveries"] = completed_ids
 
         return changed
+
+    def _trim_requests(self) -> bool:
+        requests = self.data.get("requests")
+        if not isinstance(requests, dict) or len(requests) <= MAX_REQUESTS:
+            return False
+        completed = [
+            (key, value)
+            for key, value in requests.items()
+            if isinstance(value, dict) and value.get("status") == "completed"
+        ]
+        completed.sort(key=lambda pair: float(pair[1].get("updatedAt", 0)))
+        drop = max(0, len(requests) - MAX_REQUESTS)
+        changed = False
+        for key, _ in completed[:drop]:
+            requests.pop(key, None)
+            changed = True
+        return changed
+
+    def maybe_trim(self) -> bool:
+        """Trim completed requests if the live ledger exceeds MAX_REQUESTS."""
+
+        if self._trim_requests():
+            self.save()
+            return True
+        return False
 
     def save(self) -> None:
         # ``pending`` is intentionally only a downgrade-compatible mirror;

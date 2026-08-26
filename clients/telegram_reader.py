@@ -231,6 +231,9 @@ def main() -> int:
     pending_user_ids: set[str] = set()
     bootstrap_queued = False
     stop_requested = False
+    pending_user_batch: list[tuple[str, str]] | None = None
+    pending_user_batch_ids: list[str] | None = None
+    pending_user_batch_request_id: str | None = None
 
     while not stop_requested:
         try:
@@ -293,16 +296,29 @@ def main() -> int:
                 return True
 
             def flush_users() -> bool:
-                if not pending_users:
+                nonlocal pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id
+                # batch vars are now outer-scope (hoisted above while) so a
+                # failed UDS send keeps the frozen batch across poll cycles
+                if not pending_users and pending_user_batch is None:
                     return True
-                ids = [rid for rid, _ in pending_users]
-                text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(text for _, text in pending_users)
-                request_id = stable_request_id("telegram", session_id, ids, text)
-                if uds_submit(text, "telegram", request_id=request_id) is None:
+                if pending_user_batch is None:
+                    pending_user_batch = list(pending_users)
+                    pending_user_batch_ids = [rid for rid, _ in pending_user_batch]
+                    text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(t for _, t in pending_user_batch)
+                    pending_user_batch_request_id = stable_request_id("telegram", session_id, pending_user_batch_ids, text)
+                    # Freeze the in-flight batch: clear the live collector so
+                    # new Users arriving during a UDS failure don't mutate the
+                    # retried requestId (274-301 double-submit bug).
+                    pending_users.clear()
+                    pending_user_ids.clear()
+                assert pending_user_batch is not None and pending_user_batch_ids is not None and pending_user_batch_request_id is not None
+                batch_text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(t for _, t in pending_user_batch)
+                if uds_submit(batch_text, "telegram", request_id=pending_user_batch_request_id) is None:
                     return False
-                processed.update(ids)
-                pending_user_ids.difference_update(ids)
-                pending_users.clear()
+                processed.update(pending_user_batch_ids)
+                pending_user_batch = None
+                pending_user_batch_ids = None
+                pending_user_batch_request_id = None
                 return True
 
             # flush to daemon via UDS (queue serializes; no flock needed)
