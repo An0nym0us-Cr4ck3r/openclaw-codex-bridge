@@ -43,13 +43,18 @@ Single-owner daemon. Responsibilities:
   - `item/agentMessage/delta` を集約。`turn/completed` で完了。
   - `turn/interrupt` は UDS の `cancel` メソッドで露出(将来)。
 - **Fanout**:
-  - Codex 返信を 1) Telegram (`codex-tg-send` 経由、4000 文字/chunk) 2) Miku (`openclaw agent --deliver --session-key agent:miku:telegram:direct:7536160870` の bounded worker 起動、非同期) に配信。
-  - `redact()` で credential パターンを除去してから配信。
+  - Codex 返信を durable outbox に記録してから、1) Telegram (`codex-tg-send` 経由、3500 文字/chunk) 2) Miku (`openclaw agent --deliver --session-key agent:miku:telegram:direct:7536160870`) に配信。
+  - bounded subprocess を `asyncio.to_thread` で実行し、`redact()` で credential パターンを除去してから配信。ターゲットごとに成功/失敗を記録し、指数バックオフで再試行する。
 - **通知バッファ / offset**:
-  - `~/.local/state/codex-bridge/offset.json` に `{"lastDeliveredHash": "…", "lastThreadId": "…", "pendingReplies": []}` を保持。daemon 異常終了時に未 fanout の reply を再送。UDS クライアント側は `id` で冪等判定できる(`X-Request-Id` 相当)。
-  - 再送時は `deliver_both` が Telegram の重複を避けるため `hash(reply) in deliveredSet(filesystem)` を check。
+  - `~/.local/state/codex-bridge/offset.json` は schema v2。`requests` に request fingerprint と完了レスポンス、`pendingReplies` に `deliveryId` と Telegram/Miku 各ターゲットの状態を保持する。
+  - requestId と入力 fingerprint が一致する再送は保存済みレスポンスを返し、Codex turn を二重実行しない。異なる入力で同じ requestId を使うと conflict にする。
+  - 完了レスポンスと outbox 追加は同じ atomic replace で保存する。fanout は両ターゲットが成功するまで outbox を削除しないため、daemon 異常終了後も再送できる。
+  - `pending` / `delivered` は旧 C' ver.2 との互換ミラーとして残す。
+- **検証ログ**:
+  - `~/.local/state/codex-bridge/verification.jsonl` に request replay、thread usage/rotation、outbox、fanout 成否を本文なしで fsync 記録する。
+  - `python3 tools/bridge_report.py` が offset とイベント集計を表形式または `--format json` で出力する。
 - **UDS protocol** (JSON line, `\n` delimited):
-  - Client → Daemon: `{"id":1,"method":"submit","params":{"text":"…","source":"miku"|"telegram"}}`
+  - Client → Daemon: `{"id":1,"method":"submit","params":{"text":"…","source":"miku"|"telegram","requestId":"…"}}`
   - Client → Daemon: `{"id":2,"method":"status"}`
   - Client → Daemon: `{"id":3,"method":"ping"}`
   - Daemon → Client: `{"id":1,"result":{"reply":"…","threadId":"…"}}` or `{"id":1,"error":{"code":…, "message":"…"}}`
@@ -74,8 +79,8 @@ Reader-only. Polling → UDS submit に削減。
 
 - 旧 `telegram_codex_bridge.py` (592行, 自前WS, ThreadStore, fanout) から WS/ThreadStore/fanout を削除。
 - 残す: `SESSIONS_INDEX` → `SESSION_DIR` 解決、`read_records()`、`label_record()`、`is_stop_instruction()`、4s ポーリング、offset/state (`~/.local/state/codex-telegram-bridge/state.json`)。
-- 新: 各 `User:` 行を `{"method":"submit","params":{"text":…, "source":"telegram"}}` で UDS に submit。Miku コンテキストも同様に submit(順序保証のため queue 経由)。
-- Daemon 死亡時は UDS connect 失敗を `bridge retry` として 5s 待機して再試行。`STATE_PATH` の `processed_ids` は reader 側で持つ(daemon は重複排除しない、reader が de-dup)。
+- 新: 各 `User:` 行を stable `requestId` 付きの `{"method":"submit","params":{"text":…, "source":"telegram","requestId":"…"}}` で UDS に submit。Miku コンテキストも同様に submit(順序保証のため queue 経由)。
+- Daemon 死亡時は UDS connect 失敗を `bridge retry` として 5s 待機して再試行。`STATE_PATH` の `processed_ids` は reader 側で持ち、daemon 側の request ledger と合わせて二重投入を防ぐ。
 - `deliver_both` / `deliver_to_miku` / `AppServer` クラスは削除。
 
 ## Failure Modes
@@ -84,7 +89,7 @@ Reader-only. Polling → UDS submit に削減。
 |---------|-----------|----------|
 | app-server.sock 死亡 | WS `recv` が `close` opcode or `ECONN` | 指数バックオフ再接続、queue は保持、クライアントはブロック継続 |
 | systemError (16384 items) | `thread/read` の `status.type == "systemError"` or item count > 12000 | `thread/fork` → new `activeThreadId` → retry submit |
-| daemon クラッシュ | systemd `Restart=always`; UDS clients は connect 失敗 → 5s リトライ | offset.json の `pendingReplies` を起動時に再送 |
+| daemon クラッシュ | systemd `Restart=always`; UDS clients は connect 失敗 → 5s リトライ | offset.json の per-target `pendingReplies` を fanout worker が再送 |
 | UDS stale sock | 起動時に `unlink` 前に `connect` 試行 → 成功なら他 daemon 生存とみなして exit 1 | `/run/user/1000` は tmpfs、再起動で自然に消える |
 | Telegram JSONL ロック | `sessions.json` の `sessionFile` 変更検知で行儀よく reader が session 切替 | `processed.clear()` + `bootstrap_done=False` |
 
@@ -103,16 +108,17 @@ codex-remote-control.service  — app-server 本体 (既存、維持)
 - UDS は `0700` の `XDG_RUNTIME_DIR` 配下なので同 UID のみアクセス可。追加認証は不要。
 - `redact()` は daemon fanout 前に適用。
 - `codex-tg-send` の 4000 文字/guard は維持(daemon が呼び出す)。
-- `openclaw --deliver` は daemon の bounded worker(`Popen`, `start_new_session`)で実行、失敗しても daemon 本体は落ちない。
+- `openclaw --deliver` は daemon の bounded worker(`asyncio.to_thread`, `timeout --kill-after`)で実行、失敗しても daemon 本体は落ちない。
 
 ## E2E Test Plan
 
 1. **双方向**: `miku-to-codex "PING"` → Codex reply が stdout に戻り、Telegram に `[Codex] PONG` が届く。
 2. **Miku 経由**: Telegram `User:` 行 → reader が UDS submit → daemon が Codex turn → fanout で Miku session に `Codex:` が inject される。
-3. **欠落なし**: reader が UDS 失敗中に溜めた `pending_users` を daemon 復帰後に再送、offset で二重投与を避ける。
+3. **欠落なし**: reader が UDS 失敗中に溜めた `pending_users` を daemon 復帰後に再送し、stable requestId で二重投与を避ける。返信は両 fanout target の成功まで outbox に残る。
 4. **コンテキスト保持**: 同一 `activeThreadId` で 2 連続 submit が同じ thread の続きとして Codex に届く(`turn/read` で threadId 一致確認)。
 5. **systemError 回復**: 人工的に `status=systemError` の thread を active に設定し、次の submit で fork が起きることを確認。
 6. **再接続**: `systemctl --user restart codex-remote-control` で app-server を再起動し、daemon が queue を保持したまま再接続することを確認。
+7. **長期検証**: `python3 tests/soak_bridge.py --count 10000 --crash-every 37` で state 再読込・再送・重複 request を繰り返し、完了 request/delivery 数と pending=0 を確認する。
 
 ## Heartbeat Integration
 

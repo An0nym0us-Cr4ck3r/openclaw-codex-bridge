@@ -1,10 +1,30 @@
 #!/bin/bash
 # E2E smoke: ping/status via UDS — python only, no socat needed
 set -e
-UDS="/run/user/1000/codex-bridge.sock"
+UDS="${CODEX_BRIDGE_SOCK:-/run/user/1000/codex-bridge.sock}"
 if [ ! -S "$UDS" ]; then echo "SKIP: $UDS not found (daemon not running)"; exit 0; fi
-RESP=$(python3 -c "import socket,json; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(3); s.connect('$UDS'); s.sendall(b'{\"id\":1,\"method\":\"ping\"}\n'); print(s.recv(4096).decode())" 2>&1 || echo "ERR:$RESP")
-if echo "$RESP" | grep -q '"ok"'; then echo "PASS: daemon ping"; else echo "FAIL: ping $RESP"; exit 1; fi
-RESP2=$(python3 -c "import socket,json; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.settimeout(3); s.connect('$UDS'); s.sendall(b'{\"id\":1,\"method\":\"status\"}\n'); print(s.recv(4096).decode())" 2>&1 || echo "ERR:$RESP2")
-if echo "$RESP2" | grep -q "activeThreadId"; then echo "PASS: daemon status"; else echo "FAIL: status $RESP2"; exit 1; fi
+probe() {
+  python3 - "$UDS" "$1" <<'PY'
+import json
+import socket
+import sys
+
+sock_path, method = sys.argv[1:]
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+    sock.settimeout(3)
+    sock.connect(sock_path)
+    sock.sendall((json.dumps({"id": 1, "method": method}) + "\n").encode())
+    response = json.loads(sock.recv(65536).decode().split("\n", 1)[0])
+if "error" in response:
+    raise SystemExit(response["error"])
+result = response.get("result") or {}
+if method == "ping" and result.get("ok") is not True:
+    raise SystemExit(f"unexpected ping response: {response}")
+if method == "status" and "activeThreadId" not in result:
+    raise SystemExit(f"unexpected status response: {response}")
+print(f"PASS: daemon {method}")
+PY
+}
+probe ping
+probe status
 echo "E2E smoke OK"

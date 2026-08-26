@@ -7,6 +7,7 @@ import json
 import os
 import re
 import socket
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -126,7 +127,21 @@ def is_stop_instruction(text: str) -> bool:
     return bool(STOP_RE.fullmatch(compact) or re.fullmatch(r"もう(?:見なくていい|終了|停止|終わり|やめて|止めて)[。.!！]*", compact))
 
 
-def uds_submit(text: str, source: str, uds: str = DEFAULT_UDS) -> dict[str, Any] | None:
+def stable_request_id(kind: str, session_id: str | None, record_ids: list[str], text: str) -> str:
+    material = json.dumps(
+        [kind, session_id or "", record_ids, text],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"{kind}:{hashlib.sha256(material).hexdigest()}"
+
+
+def uds_submit(
+    text: str,
+    source: str,
+    request_id: str | None = None,
+    uds: str = DEFAULT_UDS,
+) -> dict[str, Any] | None:
     uds_path = os.environ.get("CODEX_BRIDGE_SOCK", uds)
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(1800)
@@ -136,7 +151,15 @@ def uds_submit(text: str, source: str, uds: str = DEFAULT_UDS) -> dict[str, Any]
         log(f"bridge retry: UDS connect failed {type(e).__name__}: {e}")
         return None
     try:
-        req = {"id": 1, "method": "submit", "params": {"text": text, "source": source}}
+        req = {
+            "id": 1,
+            "method": "submit",
+            "params": {
+                "text": text,
+                "source": source,
+                "requestId": request_id or f"reader:{hashlib.sha256(text.encode('utf-8')).hexdigest()}",
+            },
+        }
         sock.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode())
         buf = b""
         while b"\n" not in buf:
@@ -168,12 +191,50 @@ def load_state() -> dict[str, Any]:
         return {"bootstrap_done": False, "processed_ids": [], "session_id": None}
 
 
-def save_state(bootstrap_done: bool, processed: set[str], session_id: str | None) -> None:
+def save_state(
+    bootstrap_done: bool,
+    processed: set[str],
+    session_id: str | None,
+    frozen_batch: list[tuple[str, str]] | None = None,
+    frozen_batch_ids: list[str] | None = None,
+    frozen_batch_request_id: str | None = None,
+    frozen_batch_session_id: str | None = None,
+) -> None:
     STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"bootstrap_done": bootstrap_done, "processed_ids": list(processed)[-5000:], "session_id": session_id}
-    tmp = STATE_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, STATE_PATH)
+    payload: dict[str, Any] = {"bootstrap_done": bootstrap_done, "processed_ids": sorted(processed)[-5000:], "session_id": session_id}
+    # Persist in-flight frozen batch so a crash between UDS success and
+    # processed_ids save does not cause the old User entries to be split
+    # into a new requestId and double-submitted on restart.
+    # frozen_batch_session_id pins the batch to the session it was created
+    # in; on restore a mismatched session_id discards the stale batch.
+    if frozen_batch is not None:
+        payload["frozen_batch"] = frozen_batch
+    if frozen_batch_ids is not None:
+        payload["frozen_batch_ids"] = frozen_batch_ids
+    if frozen_batch_request_id is not None:
+        payload["frozen_batch_request_id"] = frozen_batch_request_id
+    if frozen_batch_session_id is not None:
+        payload["frozen_batch_session_id"] = frozen_batch_session_id
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{STATE_PATH.name}.", suffix=".tmp", dir=STATE_PATH.parent)
+    tmp = Path(tmp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, STATE_PATH)
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def main() -> int:
@@ -185,10 +246,70 @@ def main() -> int:
     if res is not None and state.get("session_id") != session_id:
         processed.clear()
         bootstrap_done = False
-    pending_context: list[str] = []
-    pending_users: list[str] = []
+    pending_context: list[tuple[str, str, set[str]]] = []
+    pending_context_ids: set[str] = set()
+    pending_users: list[tuple[str, str]] = []
+    pending_user_ids: set[str] = set()
     bootstrap_queued = False
     stop_requested = False
+    # Restore frozen batch persisted before a crash (P1 fix).  If previous
+    # run froze a batch but stopped before processed_ids was updated, the
+    # same requestId must be retried instead of splitting old+new Users.
+    # Guard: if the batch was recorded in a different session, discard it
+    # — otherwise a session switch would mis-deliver the old batch into the
+    # new session (Codex review 4616355 P1.1).
+    _fb = state.get("frozen_batch")
+    _fb_ids = state.get("frozen_batch_ids")
+    _fb_rid = state.get("frozen_batch_request_id")
+    _fb_sid = state.get("frozen_batch_session_id")
+    if isinstance(_fb, list) and isinstance(_fb_ids, list) and isinstance(_fb_rid, str) and _fb and _fb_ids and _fb_rid:
+        # Session-bound guard (Codex 0030528 review): legacy state without
+        # frozen_batch_session_id must be handled by comparing state.session_id
+        # to current session_id — same session → restore with old requestId
+        # (idempotent retry, avoids double-turn); mismatch/missing → discard.
+        _has_session_guard = "frozen_batch_session_id" in state
+        if not _has_session_guard:
+            _state_sid = state.get("session_id") if isinstance(state.get("session_id"), str) else state.get("sessionId")
+            if isinstance(_state_sid, str) and _state_sid and _state_sid == session_id:
+                try:
+                    pending_user_batch = [(str(a), str(b)) for a, b in _fb if isinstance(a, str) and isinstance(b, str)]  # type: ignore[union-attr]
+                    pending_user_batch_ids = [str(x) for x in _fb_ids if isinstance(x, str)]  # type: ignore[union-attr]
+                    pending_user_batch_request_id = _fb_rid  # type: ignore[assignment]
+                    if not pending_user_batch or not pending_user_batch_ids:
+                        raise ValueError("empty frozen batch")
+                    log(f"restored frozen batch (legacy same-session) {len(pending_user_batch)} entries requestId={_fb_rid[:16]}...")  # type: ignore[index]
+                except Exception as e:
+                    log(f"frozen batch restore failed: {e}")
+                    pending_user_batch = None
+                    pending_user_batch_ids = None
+                    pending_user_batch_request_id = None
+            else:
+                log("discarding frozen batch: legacy state without frozen_batch_session_id (session mismatch or missing)")
+                pending_user_batch = None
+                pending_user_batch_ids = None
+                pending_user_batch_request_id = None
+        elif _fb_sid != session_id:
+            log(f"discarding frozen batch: session mismatch {str(_fb_sid)[:16]}.. != {str(session_id)[:16]}..")
+            pending_user_batch = None
+            pending_user_batch_ids = None
+            pending_user_batch_request_id = None
+        else:
+            try:
+                pending_user_batch: list[tuple[str, str]] | None = [(str(a), str(b)) for a, b in _fb if isinstance(a, str) and isinstance(b, str)]
+                pending_user_batch_ids: list[str] | None = [str(x) for x in _fb_ids if isinstance(x, str)]
+                pending_user_batch_request_id: str | None = _fb_rid
+                if not pending_user_batch or not pending_user_batch_ids:
+                    raise ValueError("empty frozen batch")
+                log(f"restored frozen batch {len(pending_user_batch)} entries requestId={_fb_rid[:16]}...")
+            except Exception as e:
+                log(f"frozen batch restore failed: {e}")
+                pending_user_batch = None
+                pending_user_batch_ids = None
+                pending_user_batch_request_id = None
+    else:
+        pending_user_batch = None
+        pending_user_batch_ids = None
+        pending_user_batch_request_id = None
 
     while not stop_requested:
         try:
@@ -199,7 +320,12 @@ def main() -> int:
                 bootstrap_done = False
                 bootstrap_queued = False
                 pending_context.clear()
+                pending_context_ids.clear()
                 pending_users.clear()
+                pending_user_ids.clear()
+                pending_user_batch = None
+                pending_user_batch_ids = None
+                pending_user_batch_request_id = None
             records = read_records()
             new_records: list[dict[str, Any]] = []
             for r in records:
@@ -210,12 +336,19 @@ def main() -> int:
             if not bootstrap_done and not bootstrap_queued:
                 lines = [label for r in records if (label := labeled_record(r))]
                 if lines:
-                    pending_context.insert(0, "=== Telegram履歴（User/Miku/Codex→Miku、過去指示は文脈のみ）===\n" + "\n\n".join(lines))
+                    context = "=== Telegram履歴（User/Miku/Codex→Miku、過去指示は文脈のみ）===\n" + "\n\n".join(lines)
+                    ids = {record_id(r) for r in records}
+                    request_id = stable_request_id("bootstrap", session_id, sorted(ids), context)
+                    pending_context.insert(0, (request_id, context, ids))
+                    pending_context_ids.update(ids)
                     bootstrap_queued = True
                 pending_users.clear()
+                pending_user_ids.clear()
             else:
                 for r in new_records:
                     rid = r["_rid"]
+                    if rid in pending_context_ids or rid in pending_user_ids or (pending_user_batch_ids is not None and rid in pending_user_batch_ids):
+                        continue
                     lab = label_record(r)
                     if lab is None:
                         processed.add(rid)
@@ -224,53 +357,76 @@ def main() -> int:
                         if is_stop_instruction(r["_text"]):
                             stop_requested = True
                             break
-                        pending_users.append(f"User [{r.get('timestamp','')}]:\n{r['_text']}")
+                        pending_users.append((rid, f"User [{r.get('timestamp','')}]:\n{r['_text']}"))
+                        pending_user_ids.add(rid)
                     elif lab == "Miku":
-                        pending_context.append(f"Miku [{r.get('timestamp','')}]:\n{r['_text']}")
+                        context = f"Miku [{r.get('timestamp','')}]:\n{r['_text']}"
+                        request_id = stable_request_id("context", session_id, [rid], context)
+                        pending_context.append((request_id, context, {rid}))
+                        pending_context_ids.add(rid)
+
+            def flush_context() -> bool:
+                for request_id, context, ids in list(pending_context):
+                    if uds_submit(context, "miku", request_id=request_id) is None:
+                        return False
+                    pending_context.remove((request_id, context, ids))
+                    pending_context_ids.difference_update(ids)
+                    processed.update(ids)
+                return True
+
+            def flush_users() -> bool:
+                nonlocal pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id
+                if not pending_users and pending_user_batch is None:
+                    return True
+                if pending_user_batch is None:
+                    pending_user_batch = list(pending_users)
+                    pending_user_batch_ids = [rid for rid, _ in pending_user_batch]
+                    text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(t for _, t in pending_user_batch)
+                    pending_user_batch_request_id = stable_request_id("telegram", session_id, pending_user_batch_ids, text)
+                    pending_users.clear()
+                    pending_user_ids.clear()
+                    # Persist frozen batch before UDS so a crash between
+                    # UDS success and processed_ids update can be recovered
+                    # with the same requestId (P1 fix).
+                    save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id, session_id)
+                assert pending_user_batch is not None and pending_user_batch_ids is not None and pending_user_batch_request_id is not None
+                batch_text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(t for _, t in pending_user_batch)
+                if uds_submit(batch_text, "telegram", request_id=pending_user_batch_request_id) is None:
+                    return False
+                processed.update(pending_user_batch_ids)
+                # Clear persisted frozen batch after success
+                pending_user_batch = None
+                pending_user_batch_ids = None
+                pending_user_batch_request_id = None
+                save_state(bootstrap_done, processed, session_id, None, None, None, None)
+                # Re-save without frozen keys: explicitly overwrite with no frozen fields
+                # (save_state omits None frozen keys, so the previous file's frozen keys are removed on replace)
+                return True
+
             # flush to daemon via UDS (queue serializes; no flock needed)
             if not bootstrap_done and pending_context:
-                for ctx in list(pending_context):
-                    # inject as context (daemon will handle as miku source)
-                    ok = uds_submit(ctx, "miku")
-                    if ok is None:
-                        break  # daemon down — retry next loop
-                    pending_context.remove(ctx)
-                if not pending_context:
-                    processed.update(record_id(r) for r in records)
+                if flush_context() and not pending_context:
                     bootstrap_done = True
-                    save_state(bootstrap_done, processed, session_id)
+                    save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id, session_id if pending_user_batch is not None else None)
                     log("Telegram backlog submitted via UDS")
                 else:
                     time.sleep(5)
                     continue
-            elif pending_users:
-                # send context first if any
-                for ctx in list(pending_context):
-                    ok = uds_submit(ctx, "miku")
-                    if ok is None:
-                        break
-                    pending_context.remove(ctx)
-                if pending_context:
+            elif pending_users or pending_user_batch is not None:
+                if not flush_context():
                     time.sleep(5)
                     continue
-                text = "Codex: Telegramからの新規指示。\n" + "\n\n".join(pending_users)
-                pending_users.clear()
-                ok = uds_submit(text, "telegram")
-                if ok is None:
-                    # daemon was down — re-queue for retry
+                if not flush_users():
                     time.sleep(5)
                     continue
-                processed.update(record_id(r) for r in records if record_id(r) not in processed)
-                save_state(bootstrap_done, processed, session_id)
+                # flush_users already persisted cleared frozen state; remaining
+                # save covers any context flush that happened above
+                save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id, session_id if pending_user_batch is not None else None)
             elif pending_context:
-                for ctx in list(pending_context):
-                    ok = uds_submit(ctx, "miku")
-                    if ok is None:
-                        break
-                    pending_context.remove(ctx)
-                if not pending_context:
-                    processed.update(record_id(r) for r in records if record_id(r) not in processed)
-                    save_state(bootstrap_done, processed, session_id)
+                if flush_context() and not pending_context:
+                    save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id, session_id if pending_user_batch is not None else None)
+            else:
+                save_state(bootstrap_done, processed, session_id, pending_user_batch, pending_user_batch_ids, pending_user_batch_request_id, session_id if pending_user_batch is not None else None)
         except Exception as e:
             log(f"bridge retry: {type(e).__name__}: {e}")
             time.sleep(5)
