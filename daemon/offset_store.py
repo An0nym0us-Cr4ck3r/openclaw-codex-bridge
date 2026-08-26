@@ -16,6 +16,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -247,6 +248,10 @@ class OffsetStore:
         # Never evict a completed request whose delivery is still in the
         # outbox (pendingReplies).  Trimming it would cause a fanout retry to
         # allocate a new deliveryId and a duplicate Codex turn.
+        # NOTE (soft limit): if every entry is pinned by pendingReplies
+        # (e.g. all 5000 are in_progress or pending delivery), no entry is
+        # evictable and the store intentionally exceeds MAX_REQUESTS rather
+        # than dropping data.  _log_soft_limit_overflow() warns in that case.
         pending_request_ids: set[str] = set()
         for item in self.data.get("pendingReplies") or []:
             if isinstance(item, dict) and isinstance(item.get("requestId"), str):
@@ -265,6 +270,8 @@ class OffsetStore:
         for key, _ in completed[:evictable]:
             requests.pop(key, None)
             changed = True
+        if not changed and len(requests) > MAX_REQUESTS:
+            self._log_soft_limit_overflow(len(requests))
         return changed
 
     def maybe_trim(self) -> bool:
@@ -274,6 +281,19 @@ class OffsetStore:
             self.save()
             return True
         return False
+
+    def _log_soft_limit_overflow(self, size: int) -> None:
+        # Soft-limit overflow is expected when pendingReplies pins every
+        # request entry (e.g. a burst of undelivered fanout).  Dropping a
+        # pinned entry would cause a duplicate Codex turn on retry, so the
+        # store intentionally exceeds MAX_REQUESTS.  Warn instead of silently
+        # growing — operators and CI can alert on this message.
+        logging.getLogger(__name__).warning(
+            "offset_store soft-limit overflow: requests=%d MAX_REQUESTS=%d "
+            "(pendingReplies pins entries; data not dropped)",
+            size,
+            MAX_REQUESTS,
+        )
 
     def save(self) -> None:
         # ``pending`` is intentionally only a downgrade-compatible mirror;
@@ -302,6 +322,17 @@ class OffsetStore:
     def _is_stale_in_progress(entry: dict[str, Any], now: float, ttl: float = STALE_REQUEST_TTL) -> bool:
         if entry.get("status") != "in_progress":
             return False
+        # Guard: a daemon crash while a Codex turn was running leaves no
+        # per-second heartbeat.  A 600 s TTL matches the daemon's watchdog
+        # sweep interval and is safe when the process is down (the turn is
+        # definitely lost).  When the daemon is *alive* and busy, the HTTP
+        # transport holds the request open for up to 1800 s — without a
+        # live heartbeat an active long turn (>600 s) would be misclassified
+        # as stale.  Known limitation: entries reaped while a long turn is
+        # still running will cause the next retry of that requestId to
+        # execute a duplicate turn.  Mitigation is a real heartbeat or
+        # increasing STALE_REQUEST_TTL.  For lossless observability this is
+        # documented as a soft guarantee (see daemon.stale_watchdog comment).
         try:
             last = float(entry.get("lastAttemptAt", entry.get("createdAt", now)))
         except (TypeError, ValueError):

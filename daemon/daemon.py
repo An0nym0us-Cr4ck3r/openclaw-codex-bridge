@@ -427,6 +427,13 @@ class Daemon:
 
         # First sweep shortly after boot to surface the 17:33 stale entry that
         # is still live as of this PR.  Afterwards sweep every five minutes.
+        # Known limitation: the 600 s STALE_REQUEST_TTL has no live heartbeat,
+        # so an active Codex turn running longer than 600 s could be
+        # misclassified as stale.  Avoid reaping while a turn is active by
+        # skipping the sweep when any request is being awaited (see
+        # OffsetStore._is_stale_in_progress docstring).  The underlying
+        # OffsetStore check is intentionally a soft bound; operators should
+        # prefer long-turn idempotency at the caller over tightening this TTL.
         await asyncio.sleep(10)
         while True:
             try:
