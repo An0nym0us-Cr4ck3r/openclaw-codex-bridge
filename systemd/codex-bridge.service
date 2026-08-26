@@ -1,0 +1,16 @@
+[Unit]
+Description=Codex Bridge Daemon — single owner of app-server.sock (C' ver.2)
+After=codex-remote-control.service
+Wants=codex-remote-control.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/openclaw/workspaces/miku/openclaw-codex-bridge
+ExecStart=/usr/bin/python3 /opt/openclaw/workspaces/miku/openclaw-codex-bridge/daemon/daemon.py --uds /run/user/1000/codex-bridge.sock --state /home/s0u7a/.local/state/codex-bridge/thread-state.json --offset /home/s0u7a/.local/state/codex-bridge/offset.json
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+
+[Install]
+WantedBy=default.target
