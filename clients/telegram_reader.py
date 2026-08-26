@@ -263,17 +263,31 @@ def main() -> int:
     _fb_rid = state.get("frozen_batch_request_id")
     _fb_sid = state.get("frozen_batch_session_id")
     if isinstance(_fb, list) and isinstance(_fb_ids, list) and isinstance(_fb_rid, str) and _fb and _fb_ids and _fb_rid:
-        # Session-bound guard: reject stale batch from a different session or
-        # from legacy state that lacked frozen_batch_session_id.  Without the
-        # session guard we cannot prove the batch belongs to the current
-        # session, so discarding is the safe default (prevents replaying an
-        # old batch into a new session after a session switch).
+        # Session-bound guard (Codex 0030528 review): legacy state without
+        # frozen_batch_session_id must be handled by comparing state.session_id
+        # to current session_id — same session → restore with old requestId
+        # (idempotent retry, avoids double-turn); mismatch/missing → discard.
         _has_session_guard = "frozen_batch_session_id" in state
         if not _has_session_guard:
-            log("discarding frozen batch: legacy state without frozen_batch_session_id")
-            pending_user_batch = None
-            pending_user_batch_ids = None
-            pending_user_batch_request_id = None
+            _state_sid = state.get("session_id") if isinstance(state.get("session_id"), str) else state.get("sessionId")
+            if isinstance(_state_sid, str) and _state_sid and _state_sid == session_id:
+                try:
+                    pending_user_batch = [(str(a), str(b)) for a, b in _fb if isinstance(a, str) and isinstance(b, str)]  # type: ignore[union-attr]
+                    pending_user_batch_ids = [str(x) for x in _fb_ids if isinstance(x, str)]  # type: ignore[union-attr]
+                    pending_user_batch_request_id = _fb_rid  # type: ignore[assignment]
+                    if not pending_user_batch or not pending_user_batch_ids:
+                        raise ValueError("empty frozen batch")
+                    log(f"restored frozen batch (legacy same-session) {len(pending_user_batch)} entries requestId={_fb_rid[:16]}...")  # type: ignore[index]
+                except Exception as e:
+                    log(f"frozen batch restore failed: {e}")
+                    pending_user_batch = None
+                    pending_user_batch_ids = None
+                    pending_user_batch_request_id = None
+            else:
+                log("discarding frozen batch: legacy state without frozen_batch_session_id (session mismatch or missing)")
+                pending_user_batch = None
+                pending_user_batch_ids = None
+                pending_user_batch_request_id = None
         elif _fb_sid != session_id:
             log(f"discarding frozen batch: session mismatch {str(_fb_sid)[:16]}.. != {str(session_id)[:16]}..")
             pending_user_batch = None
