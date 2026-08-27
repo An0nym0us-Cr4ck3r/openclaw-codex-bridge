@@ -22,6 +22,28 @@ class FakeWS:
         return ("stable reply", f"turn-{self.turns}")
 
 
+class BrokenForkWS:
+    async def thread_read(self, thread_id: str):
+        if thread_id == "old":
+            return {
+                "thread": {
+                    "status": {"type": "idle"},
+                    "turns": [{"items": [{"id": str(i)} for i in range(5)]}],
+                }
+            }
+        if thread_id == "child":
+            return {"thread": {"status": {"type": "systemError"}, "turns": []}}
+        raise AssertionError(f"unexpected thread read: {thread_id}")
+
+    async def request(self, method: str, params: dict):
+        assert method == "thread/list"
+        return {"data": []}
+
+    async def thread_fork(self, thread_id: str) -> str:
+        assert thread_id == "old"
+        return "child"
+
+
 async def exercise() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -74,6 +96,24 @@ async def exercise() -> None:
 
 def main() -> None:
     asyncio.run(exercise())
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance = bridge.Daemon(
+            root / "bridge.sock",
+            root / "thread-state.json",
+            root / "offset.json",
+            root / "verification.jsonl",
+            limit_items=5,
+        )
+        instance.store.set_active("old")
+        instance.ws = BrokenForkWS()
+        try:
+            asyncio.run(instance.ensure_active_thread())
+        except bridge.AppServerError as exc:
+            assert "systemError" in str(exc)
+        else:
+            raise AssertionError("systemError fork child was accepted")
+        assert instance.store.active_thread_id == "old"
     print("PASS daemon")
 
 

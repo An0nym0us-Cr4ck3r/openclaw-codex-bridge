@@ -233,10 +233,10 @@ class Daemon:
         for t in sorted(legacy, key=lambda x: int(x.get("recencyAt") or 0), reverse=True):
             if (t.get("status") or {}).get("type") != "systemError":
                 return t["id"]
-        # Last resort: fork the newest non-systemError (or the newest at all)
+        # Last resort: fork the newest healthy legacy thread.  Forking a
+        # systemError thread reproduces the oversized/broken history and is
+        # worse than returning no candidate.
         candidates = [t for t in legacy if (t.get("status") or {}).get("type") != "systemError"]
-        if not candidates:
-            candidates = legacy
         if candidates:
             newest = sorted(candidates, key=lambda x: int(x.get("recencyAt") or 0), reverse=True)[0]
             return await self.ws.thread_fork(newest["id"])
@@ -265,81 +265,85 @@ class Daemon:
                 turnCount=turn_count,
                 status=status_type,
             )
-            if self.store.needs_rotation(status_type=status_type, item_count=item_count, turn_count=turn_count):
-                log(f"rotation needed: status={status_type} items={item_count} turns={turn_count} — tid={tid}")
-                self.verification.append(
-                    "thread.rotation_needed",
-                    threadId=tid,
-                    itemCount=item_count,
-                    turnCount=turn_count,
-                    status=status_type,
-                )
-                # Forking a huge thread copies the huge history and the child still fails (array too long).
-                # So for systemError or excessive turns we pick a fresh small thread instead of forking the big one.
-                if status_type == "systemError" or turn_count >= self.store.limit_turns:
+            if not self.store.needs_rotation(status_type=status_type, item_count=item_count, turn_count=turn_count):
+                return tid
+
+            log(f"rotation needed: status={status_type} items={item_count} turns={turn_count} — tid={tid}")
+            self.verification.append(
+                "thread.rotation_needed",
+                threadId=tid,
+                itemCount=item_count,
+                turnCount=turn_count,
+                status=status_type,
+            )
+
+            # A systemError or turn-heavy thread should not be forked: its
+            # child may inherit the same broken/oversized history.  Prefer a
+            # separately small, healthy legacy thread and verify it again.
+            if status_type == "systemError" or turn_count >= self.store.limit_turns:
+                found = await self._pick_thread()
+                if found and found != tid:
+                    chk = await self.ws.thread_read(found)
+                    if (chk.get("thread") or {}).get("status", {}).get("type") != "systemError":
+                        self.store.set_active(found, forked_from=tid)
+                        self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=found, reason=status_type or "limit")
+                        log(f"rotated {tid} -> picked fresh {found}")
+                        return found
+
+                try:
+                    await self.ws.request("thread/compact/start", {"threadId": tid})
+                    log(f"compact started for {tid}")
+                except Exception as compact_error:
+                    log(f"compact failed: {compact_error}")
+                if status_type == "systemError":
                     found = await self._pick_thread()
                     if found and found != tid:
-                        # verify it is actually usable (not systemError)
-                        try:
-                            chk = await self.ws.thread_read(found)
-                            if (chk.get("thread") or {}).get("status", {}).get("type") != "systemError":
-                                self.store.set_active(found, forked_from=tid)
-                                self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=found, reason=status_type or "limit")
-                                log(f"rotated systemError {tid} -> picked fresh {found}")
-                                return found
-                        except Exception:
-                            pass
-                    # fallback: try compact then fail
-                    try:
-                        await self.ws.request("thread/compact/start", {"threadId": tid})
-                        log(f"compact started for {tid}")
-                    except Exception as e2:
-                        log(f"compact failed: {e2}")
-                    if status_type == "systemError":
-                        # create a fresh thread by re-picking (will fork smallest)
-                        found2 = await self._pick_thread()
-                        if found2:
-                            self.store.set_active(found2, forked_from=tid)
-                            self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=found2, reason="systemError")
-                            return found2
-                        raise AppServerError(f"systemError on {tid} and no alternative thread")
-                # Normal rotation (not systemError): fork
-                try:
-                    new_id = await self.ws.thread_fork(tid)
-                    # Verify child is not immediately systemError (fork of huge history)
-                    try:
-                        child_info = await self.ws.thread_read(new_id)
-                        if (child_info.get("thread") or {}).get("status", {}).get("type") == "systemError":
-                            log(f"forked child {new_id} is still systemError — discarding, picking fresh")
-                            found = await self._pick_thread()
-                            if found and found != tid:
-                                self.store.set_active(found, forked_from=tid)
-                                return found
-                    except Exception:
-                        pass
-                    self.store.set_active(new_id, forked_from=tid)
-                    self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=new_id, reason="limit")
-                    log(f"forked {tid} -> {new_id}")
-                    return new_id
-                except Exception as e:
-                    log(f"fork failed: {e} — trying compact")
-                    try:
-                        await self.ws.request("thread/compact/start", {"threadId": tid})
-                        log(f"compact started for {tid}")
-                    except Exception as e2:
-                        log(f"compact failed: {e2}")
-                    if status_type == "systemError":
-                        found = await self._pick_thread()
-                        if found and found != tid:
-                            self.store.set_active(found)
+                        chk = await self.ws.thread_read(found)
+                        if (chk.get("thread") or {}).get("status", {}).get("type") != "systemError":
+                            self.store.set_active(found, forked_from=tid)
                             self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=found, reason="systemError")
                             return found
-                        raise
+                    raise AppServerError(f"systemError on {tid} and no healthy alternative thread")
+
+            # Item-heavy threads use the existing fork path, but the child is
+            # read and validated before the pointer is persisted.
+            try:
+                new_id = await self.ws.thread_fork(tid)
+                child_info = await self.ws.thread_read(new_id)
+                child_status = (child_info.get("thread") or {}).get("status", {}).get("type")
+                if child_status == "systemError":
+                    log(f"forked child {new_id} is still systemError — discarding, picking fresh")
+                    found = await self._pick_thread()
+                    if found and found not in {tid, new_id}:
+                        found_info = await self.ws.thread_read(found)
+                        if (found_info.get("thread") or {}).get("status", {}).get("type") != "systemError":
+                            self.store.set_active(found, forked_from=tid)
+                            self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=found, reason="limit-fallback")
+                            return found
+                    raise AppServerError(f"forked child {new_id} is systemError and no healthy thread is available")
+                self.store.set_active(new_id, forked_from=tid)
+                self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=new_id, reason="limit")
+                log(f"forked {tid} -> {new_id}")
+                return new_id
+            except AppServerError:
+                raise
+            except (OSError, BrokenPipeError, ConnectionResetError):
+                raise
+            except Exception as fork_error:
+                log(f"fork failed: {fork_error} — trying compact")
+                try:
+                    await self.ws.request("thread/compact/start", {"threadId": tid})
+                    log(f"compact started for {tid}")
+                except Exception as compact_error:
+                    log(f"compact failed: {compact_error}")
+                raise
         except AppServerError:
             raise
-        except Exception as e:
-            log(f"ensure_active_thread check failed: {e}")
-        return tid
+        except (OSError, BrokenPipeError, ConnectionResetError):
+            raise
+        except Exception as error:
+            log(f"ensure_active_thread check failed: {error}")
+            raise
 
     async def _reconnect_ws(self) -> None:
         self._ws_connected = False
