@@ -236,9 +236,17 @@ def uds_submit(
 
 def load_state() -> dict[str, Any]:
     try:
-        return json.loads(STATE_PATH.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError):
+        value = json.loads(STATE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
         return {"bootstrap_done": False, "processed_ids": [], "session_id": None}
+    except json.JSONDecodeError as exc:
+        # Resetting a damaged cursor silently would replay the whole session.
+        # Keep the evidence intact and let systemd surface the failure for
+        # recovery instead of replacing it with an empty state.
+        raise RuntimeError(f"invalid reader state JSON: {STATE_PATH}") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError(f"reader state must be a JSON object: {STATE_PATH}")
+    return value
 
 
 def save_state(
@@ -283,6 +291,14 @@ def save_state(
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, STATE_PATH)
+        try:
+            dir_fd = os.open(STATE_PATH.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError:
+            pass
     except Exception:
         try:
             os.close(fd)

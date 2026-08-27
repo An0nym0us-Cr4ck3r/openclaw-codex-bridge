@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import stat
 import tempfile
 from pathlib import Path
 import sys
@@ -57,7 +58,25 @@ def test_state_round_trip_is_atomic() -> None:
             assert state["bootstrap_done"] is True
             assert state["processed_ids"] == ["a", "b"]
             assert state["processed_cursor"] == 0
+            assert stat.S_IMODE(reader.STATE_PATH.stat().st_mode) == 0o600
             assert not list(Path(directory).glob("*.tmp"))
+        finally:
+            reader.STATE_PATH = previous
+
+
+def test_corrupt_state_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        previous = reader.STATE_PATH
+        reader.STATE_PATH = Path(directory) / "state.json"
+        try:
+            reader.STATE_PATH.write_text("{not-json", encoding="utf-8")
+            try:
+                reader.load_state()
+            except RuntimeError as exc:
+                assert "invalid reader state JSON" in str(exc)
+            else:
+                raise AssertionError("corrupt reader state was silently accepted")
+            assert reader.STATE_PATH.read_text(encoding="utf-8") == "{not-json"
         finally:
             reader.STATE_PATH = previous
 
@@ -68,4 +87,5 @@ if __name__ == "__main__":
     test_processed_cursor_compacts_only_acknowledged_prefix()
     test_codex_to_miku_is_non_actionable()
     test_state_round_trip_is_atomic()
+    test_corrupt_state_fails_closed()
     print("PASS reader")
