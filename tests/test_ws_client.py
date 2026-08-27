@@ -156,6 +156,48 @@ async def test_idle_timeout_interrupts_the_active_turn() -> None:
     assert interrupted == [{"threadId": "thread", "turnId": "new"}]
 
 
+async def test_total_timeout_is_not_extended_by_progress() -> None:
+    client = WSClient("unused")
+    interrupted: list[dict] = []
+
+    async def fake_request(method: str, params: dict):
+        if method == "thread/read":
+            return {"thread": {"turns": []}}
+        if method == "turn/start":
+            return {"turn": {"id": "new"}}
+        if method == "turn/interrupt":
+            interrupted.append(params)
+            return {}
+        raise AssertionError(f"unexpected request: {method} {params}")
+
+    client.request = fake_request  # type: ignore[method-assign]
+    stop = asyncio.Event()
+
+    async def keep_progressing() -> None:
+        while not stop.is_set():
+            client._event_q.put_nowait(
+                {"method": "item/agentMessage/delta", "params": {"turnId": "new", "delta": "."}}
+            )
+            await asyncio.sleep(0.003)
+
+    producer = asyncio.create_task(keep_progressing())
+    try:
+        try:
+            await client.run_turn("thread", "hello", idle_timeout=0.02, total_timeout=0.04)
+        except AppServerError as exc:
+            assert "total timeout" in str(exc)
+        else:
+            raise AssertionError("progress stream bypassed total timeout")
+    finally:
+        stop.set()
+        producer.cancel()
+        try:
+            await producer
+        except asyncio.CancelledError:
+            pass
+    assert interrupted == [{"threadId": "thread", "turnId": "new"}]
+
+
 def main() -> None:
     asyncio.run(test_turn_events_are_scoped_to_the_current_turn())
     asyncio.run(test_close_fails_pending_requests_and_discards_events())
@@ -164,6 +206,7 @@ def main() -> None:
     asyncio.run(test_bounded_control_request_surfaces_timeout())
     asyncio.run(test_terminal_error_notification_is_not_ignored())
     asyncio.run(test_idle_timeout_interrupts_the_active_turn())
+    asyncio.run(test_total_timeout_is_not_extended_by_progress())
     print("PASS ws_client")
 
 

@@ -14,6 +14,7 @@ class AppServerError(RuntimeError):
 
 
 TURN_IDLE_TIMEOUT_SECONDS = 300.0
+TURN_TOTAL_TIMEOUT_SECONDS = 300.0
 CONTROL_REQUEST_TIMEOUT_SECONDS = 60.0
 
 
@@ -324,9 +325,15 @@ class WSClient:
         text: str,
         *,
         idle_timeout: float = TURN_IDLE_TIMEOUT_SECONDS,
+        total_timeout: float = TURN_TOTAL_TIMEOUT_SECONDS,
     ) -> tuple[str, str]:
         """Start or steer a turn and return (reply, turnId)."""
         self._ensure_event_q()
+        if idle_timeout <= 0:
+            raise ValueError("idle_timeout must be positive")
+        if total_timeout <= 0:
+            raise ValueError("total_timeout must be positive")
+        turn_deadline = asyncio.get_running_loop().time() + total_timeout
         # check active turn
         read = await self.thread_read(thread_id)
         thread = read.get("thread") or {}
@@ -369,24 +376,28 @@ class WSClient:
                 return str(c["text"])
             return ""
 
-        if idle_timeout <= 0:
-            raise ValueError("idle_timeout must be positive")
         idle_deadline = asyncio.get_running_loop().time() + idle_timeout
         while True:
-            remaining = idle_deadline - asyncio.get_running_loop().time()
+            now = asyncio.get_running_loop().time()
+            idle_remaining = idle_deadline - now
+            total_remaining = turn_deadline - now
+            remaining = min(idle_remaining, total_remaining)
             if remaining <= 0:
                 if turn_id:
                     await self._interrupt_best_effort(thread_id, str(turn_id))
+                reason = "total timeout" if total_remaining <= idle_remaining else "idle timeout"
                 raise AppServerError(
-                    f"turn {turn_id or '<unknown>'} idle timeout after {idle_timeout:.1f}s"
+                    f"turn {turn_id or '<unknown>'} {reason}"
                 )
             try:
                 msg = await asyncio.wait_for(self._event_q.get(), timeout=remaining)
             except asyncio.TimeoutError as exc:
                 if turn_id:
                     await self._interrupt_best_effort(thread_id, str(turn_id))
+                now = asyncio.get_running_loop().time()
+                reason = "total timeout" if turn_deadline <= now + 1e-6 else "idle timeout"
                 raise AppServerError(
-                    f"turn {turn_id or '<unknown>'} idle timeout after {idle_timeout:.1f}s"
+                    f"turn {turn_id or '<unknown>'} {reason}"
                 ) from exc
             if "_error" in msg:
                 raise AppServerError(str(msg["_error"]))
