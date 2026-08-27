@@ -265,7 +265,14 @@ class Daemon:
                 continue
             try:
                 info = await self.ws.thread_read(thread_id)
-                n = len(((info.get("thread") or {}).get("turns")) or [])
+                info_thread = info.get("thread") or {}
+                if (info_thread.get("status") or {}).get("type") == "systemError":
+                    continue
+                info_turns = info_thread.get("turns") or []
+                n = len(info_turns)
+                item_count = sum(len(turn.get("items") or []) for turn in info_turns if isinstance(turn, dict))
+                if n >= self.store.limit_turns or item_count >= self.store.limit_items:
+                    continue
             except Exception:
                 continue
             try:

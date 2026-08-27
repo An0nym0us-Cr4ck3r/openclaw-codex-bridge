@@ -44,10 +44,43 @@ class BrokenForkWS:
         return "child"
 
 
+class StaleThreadListWS:
+    async def request(self, method: str, params: dict):
+        assert method == "thread/list"
+        return {
+            "data": [
+                {"id": "stale", "historyMode": "legacy", "status": {"type": "idle"}, "recencyAt": 2},
+                {"id": "healthy", "historyMode": "legacy", "status": {"type": "idle"}, "recencyAt": 1},
+            ]
+        }
+
+    async def thread_read(self, thread_id: str):
+        if thread_id == "stale":
+            return {"thread": {"status": {"type": "systemError"}, "turns": []}}
+        if thread_id == "healthy":
+            return {"thread": {"status": {"type": "idle"}, "turns": [{"items": [{"id": "one"}]}]}}
+        raise AssertionError(f"unexpected thread read: {thread_id}")
+
+
 def test_detailed_delivery_failure_is_not_truthy_success() -> None:
     assert bridge.normalize_delivery_result((False, "openclaw failed")) == (False, "openclaw failed")
     assert bridge.normalize_delivery_result((True, "")) == (True, "")
     assert bridge.normalize_delivery_result(False) == (False, "delivery returned false")
+
+
+async def test_thread_picker_verifies_live_status_and_limits() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance = bridge.Daemon(
+            root / "bridge.sock",
+            root / "thread-state.json",
+            root / "offset.json",
+            root / "verification.jsonl",
+            limit_items=5,
+            limit_turns=3,
+        )
+        instance.ws = StaleThreadListWS()
+        assert await instance._pick_thread() == "healthy"
 
 
 async def exercise_partial_fanout() -> None:
@@ -148,6 +181,7 @@ async def exercise() -> None:
 
 def main() -> None:
     asyncio.run(exercise())
+    asyncio.run(test_thread_picker_verifies_live_status_and_limits())
     asyncio.run(exercise_partial_fanout())
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
