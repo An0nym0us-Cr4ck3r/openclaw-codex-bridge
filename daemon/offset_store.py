@@ -17,6 +17,7 @@ import copy
 import hashlib
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -147,9 +148,17 @@ class OffsetStore:
                         result[key] = max(0, int(value[key]))
                     except (TypeError, ValueError):
                         result[key] = 0
-            for key in ("lastError", "deliveredAt", "lastAttemptAt", "nextAttemptAt"):
-                if key in value and value[key] is not None:
-                    result[key] = value[key]
+            if "lastError" in value and value["lastError"] is not None:
+                result["lastError"] = str(value["lastError"])[:500]
+            for key in ("deliveredAt", "lastAttemptAt", "nextAttemptAt"):
+                if key not in value or value[key] is None:
+                    continue
+                try:
+                    timestamp = float(value[key])
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(timestamp):
+                    result[key] = timestamp
             return result
         return {"delivered": bool(value), "attempts": 0}
 
@@ -502,11 +511,16 @@ class OffsetStore:
             targets = item.get("targets") or {}
             if all(bool((targets.get(target) or {}).get("delivered")) for target in TARGETS):
                 continue
-            available = [
-                float((targets.get(target) or {}).get("nextAttemptAt", 0))
-                for target in TARGETS
-                if not (targets.get(target) or {}).get("delivered")
-            ]
+            available: list[float] = []
+            for target in TARGETS:
+                state = targets.get(target) or {}
+                if state.get("delivered"):
+                    continue
+                try:
+                    next_attempt = float(state.get("nextAttemptAt", 0))
+                except (TypeError, ValueError):
+                    next_attempt = 0.0
+                available.append(next_attempt if math.isfinite(next_attempt) else 0.0)
             if not available or min(available) <= current:
                 result.append(copy.deepcopy(item))
         return result

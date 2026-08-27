@@ -112,6 +112,38 @@ def test_current_empty_outbox_does_not_remigrate_compatibility_mirror() -> None:
         assert json.loads(path.read_text(encoding="utf-8"))["pending"] == []
 
 
+def test_malformed_retry_timestamp_is_safe_to_retry() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "offset.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "pendingReplies": [
+                        {
+                            "deliveryId": "delivery-1",
+                            "requestId": "request-1",
+                            "reply": "retry me",
+                            "targets": {
+                                "telegram": {"delivered": False, "attempts": "bad", "nextAttemptAt": "bad"},
+                                "miku": {"delivered": False},
+                            },
+                        }
+                    ],
+                    "completedDeliveries": [],
+                    "requests": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = OffsetStore(path)
+        pending = store.pending_replies(now=time.time())
+        assert len(pending) == 1
+        telegram = pending[0]["targets"]["telegram"]
+        assert telegram["attempts"] == 0
+        assert "nextAttemptAt" not in telegram
+
+
 def test_corrupt_state_fails_closed() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "offset.json"
@@ -198,6 +230,7 @@ def main() -> None:
     test_target_chunk_progress_is_durable()
     test_legacy_pending_migration()
     test_current_empty_outbox_does_not_remigrate_compatibility_mirror()
+    test_malformed_retry_timestamp_is_safe_to_retry()
     test_corrupt_state_fails_closed()
     test_trim_tolerates_invalid_timestamps()
     test_stale_in_progress_reap()
