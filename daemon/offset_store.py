@@ -141,6 +141,12 @@ class OffsetStore:
                 "delivered": delivered,
                 "attempts": attempts,
             }
+            for key in ("chunkIndex", "chunkTotal"):
+                if key in value and value[key] is not None:
+                    try:
+                        result[key] = max(0, int(value[key]))
+                    except (TypeError, ValueError):
+                        result[key] = 0
             for key in ("lastError", "deliveredAt", "lastAttemptAt", "nextAttemptAt"):
                 if key in value and value[key] is not None:
                     result[key] = value[key]
@@ -528,6 +534,60 @@ class OffsetStore:
                     for candidate in self.data["pendingReplies"]
                     if candidate.get("deliveryId") != delivery_id
                 ]
+            self.save()
+            return True
+        return False
+
+    def mark_target_chunk_delivered(
+        self,
+        delivery_id: str,
+        target: str,
+        chunk_index: int,
+        chunk_total: int,
+    ) -> bool:
+        """Persist one successful chunk and complete the target at the end.
+
+        A crash after sending chunk N but before this checkpoint can still
+        duplicate that one chunk (the downstream sink has no transaction
+        protocol), but a later chunk failure will not make already-checkpointed
+        chunks start over from zero.
+        """
+
+        if target not in TARGETS:
+            raise ValueError(f"unknown fanout target: {target}")
+        if chunk_total < 1 or chunk_index < 0 or chunk_index >= chunk_total:
+            raise ValueError("invalid delivery chunk position")
+        for item in self.data.get("pendingReplies", []):
+            if item.get("deliveryId") != delivery_id:
+                continue
+            state = item.setdefault("targets", {}).setdefault(target, {"delivered": False, "attempts": 0})
+            if state.get("delivered"):
+                return False
+            try:
+                current = max(0, int(state.get("chunkIndex", 0)))
+            except (TypeError, ValueError):
+                current = 0
+            if current != chunk_index:
+                # A duplicate/out-of-order worker must not advance the
+                # durable cursor past an unconfirmed chunk.
+                return False
+            state["chunkIndex"] = current + 1
+            state["chunkTotal"] = chunk_total
+            state["attempts"] = max(1, int(state.get("attempts", 0)))
+            state.pop("lastError", None)
+            state.pop("nextAttemptAt", None)
+            if current + 1 >= chunk_total:
+                state["delivered"] = True
+                state["deliveredAt"] = time.time()
+                targets = item["targets"]
+                if all(bool((targets.get(name) or {}).get("delivered")) for name in TARGETS):
+                    self.data.setdefault("completedDeliveries", []).append(delivery_id)
+                    self.data["completedDeliveries"] = self.data["completedDeliveries"][-MAX_COMPLETED_DELIVERIES:]
+                    self.data["pendingReplies"] = [
+                        candidate
+                        for candidate in self.data["pendingReplies"]
+                        if candidate.get("deliveryId") != delivery_id
+                    ]
             self.save()
             return True
         return False

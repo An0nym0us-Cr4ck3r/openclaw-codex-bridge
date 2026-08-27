@@ -57,6 +57,27 @@ def test_retry_backoff_and_conflict() -> None:
             raise AssertionError("request id conflict was not detected")
 
 
+def test_target_chunk_progress_is_durable() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "offset.json"
+        store = OffsetStore(path)
+        fingerprint = request_fingerprint("miku", "chunked")
+        store.begin_request("req-chunked", fingerprint)
+        delivery_id = store.finish_request(
+            "req-chunked",
+            fingerprint,
+            {"reply": "long", "threadId": "t", "turnId": "u"},
+        )
+        assert delivery_id
+        assert store.mark_target_chunk_delivered(delivery_id, "telegram", 0, 3)
+        assert not store.mark_target_chunk_delivered(delivery_id, "telegram", 0, 3)
+        assert store.get_delivery(delivery_id)["targets"]["telegram"]["chunkIndex"] == 1
+        restarted = OffsetStore(path)
+        assert restarted.mark_target_chunk_delivered(delivery_id, "telegram", 1, 3)
+        assert restarted.mark_target_chunk_delivered(delivery_id, "telegram", 2, 3)
+        assert restarted.get_delivery(delivery_id)["targets"]["telegram"]["delivered"] is True
+
+
 def test_legacy_pending_migration() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "offset.json"
@@ -152,6 +173,7 @@ def test_stale_reap_excludes_live_requests() -> None:
 def main() -> None:
     test_restart_idempotency_and_outbox()
     test_retry_backoff_and_conflict()
+    test_target_chunk_progress_is_durable()
     test_legacy_pending_migration()
     test_corrupt_state_fails_closed()
     test_trim_tolerates_invalid_timestamps()
