@@ -62,10 +62,66 @@ async def test_dead_receive_task_is_not_reused() -> None:
         raise AssertionError("completed receive task was reused")
 
 
+async def test_terminal_error_notification_is_not_ignored() -> None:
+    client = WSClient("unused")
+
+    async def fake_request(method: str, params: dict):
+        if method == "thread/read":
+            return {"thread": {"turns": []}}
+        if method == "turn/start":
+            client._event_q.put_nowait(
+                {
+                    "method": "error",
+                    "params": {
+                        "threadId": "thread",
+                        "turnId": "new",
+                        "willRetry": False,
+                        "error": {"message": "provider failed"},
+                    },
+                }
+            )
+            return {"turn": {"id": "new"}}
+        raise AssertionError(f"unexpected request: {method} {params}")
+
+    client.request = fake_request  # type: ignore[method-assign]
+    try:
+        await client.run_turn("thread", "hello", idle_timeout=0.1)
+    except AppServerError as exc:
+        assert "provider failed" in str(exc)
+    else:
+        raise AssertionError("terminal error notification was ignored")
+
+
+async def test_idle_timeout_interrupts_the_active_turn() -> None:
+    client = WSClient("unused")
+    interrupted: list[dict] = []
+
+    async def fake_request(method: str, params: dict):
+        if method == "thread/read":
+            return {"thread": {"turns": []}}
+        if method == "turn/start":
+            return {"turn": {"id": "new"}}
+        if method == "turn/interrupt":
+            interrupted.append(params)
+            return {}
+        raise AssertionError(f"unexpected request: {method} {params}")
+
+    client.request = fake_request  # type: ignore[method-assign]
+    try:
+        await client.run_turn("thread", "hello", idle_timeout=0.01)
+    except AppServerError as exc:
+        assert "idle timeout" in str(exc)
+    else:
+        raise AssertionError("idle turn did not time out")
+    assert interrupted == [{"threadId": "thread", "turnId": "new"}]
+
+
 def main() -> None:
     asyncio.run(test_turn_events_are_scoped_to_the_current_turn())
     asyncio.run(test_close_fails_pending_requests_and_discards_events())
     asyncio.run(test_dead_receive_task_is_not_reused())
+    asyncio.run(test_terminal_error_notification_is_not_ignored())
+    asyncio.run(test_idle_timeout_interrupts_the_active_turn())
     print("PASS ws_client")
 
 

@@ -13,6 +13,9 @@ class AppServerError(RuntimeError):
     pass
 
 
+TURN_IDLE_TIMEOUT_SECONDS = 300.0
+
+
 class WSClient:
     """Single WS owner. Call connect() once, then request()/run_turn()."""
 
@@ -207,6 +210,44 @@ class WSClient:
                     return str(value)
         return None
 
+    @staticmethod
+    def _event_thread_id(msg: dict[str, Any]) -> str | None:
+        params = msg.get("params") or {}
+        if not isinstance(params, dict):
+            return None
+        for key in ("threadId", "thread_id"):
+            value = params.get(key)
+            if value is not None:
+                return str(value)
+        turn = params.get("turn")
+        if isinstance(turn, dict):
+            for key in ("threadId", "thread_id"):
+                value = turn.get(key)
+                if value is not None:
+                    return str(value)
+        item = params.get("item")
+        if isinstance(item, dict):
+            for key in ("threadId", "thread_id"):
+                value = item.get(key)
+                if value is not None:
+                    return str(value)
+        return None
+
+    @staticmethod
+    def _error_message(msg: dict[str, Any]) -> str:
+        params = msg.get("params") or {}
+        error = params.get("error") if isinstance(params, dict) else None
+        if isinstance(error, dict):
+            message = error.get("message")
+            details = error.get("additionalDetails")
+            if isinstance(message, str) and isinstance(details, str) and details:
+                return f"{message}: {details}"[:400]
+            if isinstance(message, str) and message:
+                return message[:400]
+        if isinstance(error, str) and error:
+            return error[:400]
+        return "app-server reported a turn error"
+
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_event_q()
         if self.writer is None or self._bg_task is None or self._bg_task.done():
@@ -235,6 +276,18 @@ class WSClient:
             raise AppServerError("fork returned no thread id")
         return str(new_id)
 
+    async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
+        await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+
+    async def _interrupt_best_effort(self, thread_id: str, turn_id: str) -> None:
+        try:
+            await asyncio.wait_for(self.interrupt_turn(thread_id, turn_id), timeout=5.0)
+        except Exception:
+            # Timeout cleanup must never replace the turn timeout with another
+            # unbounded wait.  The next thread/read will observe the resulting
+            # app-server state and can reconnect or rotate as needed.
+            pass
+
     async def inject_items(self, thread_id: str, text: str) -> None:
         # chunk to avoid huge payload
         CHUNK = 32000
@@ -242,7 +295,13 @@ class WSClient:
             part = text[i : i + CHUNK]
             await self.request("thread/inject_items", {"threadId": thread_id, "items": [{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": part}]}]})
 
-    async def run_turn(self, thread_id: str, text: str) -> tuple[str, str]:
+    async def run_turn(
+        self,
+        thread_id: str,
+        text: str,
+        *,
+        idle_timeout: float = TURN_IDLE_TIMEOUT_SECONDS,
+    ) -> tuple[str, str]:
         """Start or steer a turn and return (reply, turnId)."""
         self._ensure_event_q()
         # check active turn
@@ -287,17 +346,44 @@ class WSClient:
                 return str(c["text"])
             return ""
 
+        if idle_timeout <= 0:
+            raise ValueError("idle_timeout must be positive")
+        idle_deadline = asyncio.get_running_loop().time() + idle_timeout
         while True:
-            msg = await self._event_q.get()
+            remaining = idle_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                if turn_id:
+                    await self._interrupt_best_effort(thread_id, str(turn_id))
+                raise AppServerError(
+                    f"turn {turn_id or '<unknown>'} idle timeout after {idle_timeout:.1f}s"
+                )
+            try:
+                msg = await asyncio.wait_for(self._event_q.get(), timeout=remaining)
+            except asyncio.TimeoutError as exc:
+                if turn_id:
+                    await self._interrupt_best_effort(thread_id, str(turn_id))
+                raise AppServerError(
+                    f"turn {turn_id or '<unknown>'} idle timeout after {idle_timeout:.1f}s"
+                ) from exc
             if "_error" in msg:
                 raise AppServerError(str(msg["_error"]))
             method = msg.get("method", "")
             params = msg.get("params") or {}
+            event_thread_id = self._event_thread_id(msg)
+            if event_thread_id is not None and event_thread_id != str(thread_id):
+                continue
             event_turn_id = self._event_turn_id(msg)
             if event_turn_id is not None and turn_id is not None and event_turn_id != str(turn_id):
                 continue
             if event_turn_id is not None and turn_id is None:
                 turn_id = event_turn_id
+            if method == "error":
+                if isinstance(params, dict) and params.get("willRetry") is False:
+                    raise AppServerError(
+                        f"turn {turn_id or '<unknown>'} failed: {self._error_message(msg)}"
+                    )
+                idle_deadline = asyncio.get_running_loop().time() + idle_timeout
+                continue
             if method == "item/agentMessage/delta":
                 delta = params.get("delta") or params.get("text") or ""
                 if isinstance(delta, str):
@@ -312,4 +398,19 @@ class WSClient:
                 completed = params.get("turn") or {}
                 cid = completed.get("id") or params.get("turnId")
                 if turn_id is None or cid in {None, turn_id, str(turn_id)}:
+                    status = completed.get("status") if isinstance(completed, dict) else None
+                    if status and status != "completed":
+                        error = completed.get("error") if isinstance(completed, dict) else None
+                        detail = error.get("message") if isinstance(error, dict) else None
+                        suffix = f": {detail}" if isinstance(detail, str) and detail else ""
+                        raise AppServerError(
+                            f"turn {turn_id or '<unknown>'} ended with status {status}{suffix}"
+                        )
                     return ("".join(output).strip(), turn_id or "")
+            if method in {
+                "turn/started",
+                "item/started",
+                "item/completed",
+                "item/agentMessage/delta",
+            } or event_turn_id is not None:
+                idle_deadline = asyncio.get_running_loop().time() + idle_timeout
