@@ -442,19 +442,19 @@ class Daemon:
         return bool(self._active_request_ids or self.queue.qsize() > 0)
 
     def _reap_with_active_guard(self) -> list[str]:
-        """Reap stale entries, skipping any requestId whose turn is live.
+        """Reap stale entries, skipping requestIds whose turns are live.
 
         The long-turn bug is that ``OffsetStore._is_stale_in_progress`` uses
         only a 600 s TTL without a live heartbeat, so the watchdog must not
-        call it.  The fix requested is: if a Codex turn is certainly active
-        (``_active_request_ids`` or queue), defer the entire sweep; otherwise
-        it is safe to use the TTL-based reap because no turn is running.
+        call it for an active request.  Protect only the active IDs instead of
+        deferring the entire sweep, otherwise unrelated stale entries would
+        accumulate during continuous traffic.
         """
 
-        if self._is_turn_active():
-            log("stale watchdog deferred: active turn in progress")
-            return []
-        return self.offset.reap_stale_requests()
+        active_ids = set(self._active_request_ids)
+        if active_ids:
+            log(f"stale watchdog protecting active requests: {len(active_ids)}")
+        return self.offset.reap_stale_requests(exclude_request_ids=active_ids)
 
     async def stale_watchdog(self) -> None:
         """Periodically reap ``in_progress`` requests that never finished."""

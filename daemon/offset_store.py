@@ -339,20 +339,31 @@ class OffsetStore:
             return True
         return (now - last) > ttl
 
-    def reap_stale_requests(self, now: float | None = None, ttl: float | None = None) -> list[str]:
+    def reap_stale_requests(
+        self,
+        now: float | None = None,
+        ttl: float | None = None,
+        exclude_request_ids: set[str] | None = None,
+    ) -> list[str]:
         """Remove ``in_progress`` entries older than ``ttl``.
 
+        ``exclude_request_ids`` protects requests whose turn is known to be
+        live.  Other stale requests can still be reaped while that turn runs,
+        so one slow request does not prevent cleanup of unrelated crashes.
         Returns the list of request ids that were removed so the caller can
         emit a verification event.  Completed entries are never reaped here.
         """
 
         current = time.time() if now is None else now
         threshold = STALE_REQUEST_TTL if ttl is None else ttl
+        excluded = exclude_request_ids or set()
         requests = self.data.get("requests") or {}
         stale = [
             key
             for key, value in list(requests.items())
-            if isinstance(value, dict) and self._is_stale_in_progress(value, current, threshold)
+            if key not in excluded
+            and isinstance(value, dict)
+            and self._is_stale_in_progress(value, current, threshold)
         ]
         if stale:
             for key in stale:

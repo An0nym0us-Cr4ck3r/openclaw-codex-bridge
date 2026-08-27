@@ -104,11 +104,29 @@ def test_stale_in_progress_reap() -> None:
         assert "req-done" in OffsetStore(Path(directory) / "done.json").data["requests"]
 
 
+def test_stale_reap_excludes_live_requests() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "offset.json"
+        store = OffsetStore(path)
+        old = time.time() - 700
+        for request_id in ("req-live", "req-crashed"):
+            fp = request_fingerprint("miku", request_id)
+            store.begin_request(request_id, fp)
+            store.data["requests"][request_id]["createdAt"] = old
+            store.data["requests"][request_id]["lastAttemptAt"] = old
+        store.save()
+        reaped = store.reap_stale_requests(exclude_request_ids={"req-live"})
+        assert reaped == ["req-crashed"]
+        assert "req-live" in store.data["requests"]
+        assert "req-crashed" not in store.data["requests"]
+
+
 def main() -> None:
     test_restart_idempotency_and_outbox()
     test_retry_backoff_and_conflict()
     test_legacy_pending_migration()
     test_stale_in_progress_reap()
+    test_stale_reap_excludes_live_requests()
     print("PASS offset_store")
 
 
