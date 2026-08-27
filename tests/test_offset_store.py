@@ -69,6 +69,34 @@ def test_legacy_pending_migration() -> None:
         assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
 
 
+def test_corrupt_state_fails_closed() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "offset.json"
+        path.write_text("{not-json", encoding="utf-8")
+        try:
+            OffsetStore(path)
+        except RuntimeError as exc:
+            assert "invalid offset state JSON" in str(exc)
+        else:
+            raise AssertionError("corrupt offset state was silently accepted")
+        assert path.read_text(encoding="utf-8") == "{not-json"
+
+
+def test_trim_tolerates_invalid_timestamps() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "offset.json"
+        store = OffsetStore(path)
+        for index in range(5001):
+            store.data["requests"][f"req-{index}"] = {
+                "fingerprint": f"fp-{index}",
+                "status": "completed",
+                "updatedAt": "not-a-timestamp" if index == 0 else index,
+                "result": {"reply": ""},
+            }
+        assert store.maybe_trim()
+        assert len(store.data["requests"]) == 5000
+
+
 def test_stale_in_progress_reap() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "offset.json"
@@ -125,6 +153,8 @@ def main() -> None:
     test_restart_idempotency_and_outbox()
     test_retry_backoff_and_conflict()
     test_legacy_pending_migration()
+    test_corrupt_state_fails_closed()
+    test_trim_tolerates_invalid_timestamps()
     test_stale_in_progress_reap()
     test_stale_reap_excludes_live_requests()
     print("PASS offset_store")

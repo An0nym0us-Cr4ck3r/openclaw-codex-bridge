@@ -118,9 +118,16 @@ class OffsetStore:
     def _load(self) -> dict[str, Any]:
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+        except FileNotFoundError:
             return self._default_data()
-        return value if isinstance(value, dict) else self._default_data()
+        except json.JSONDecodeError as exc:
+            # An empty ledger would make retries execute a second Codex turn.
+            # Keep the damaged file intact and fail closed so it can be
+            # recovered instead of silently replacing evidence with {}.
+            raise RuntimeError(f"invalid offset state JSON: {self.path}") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(f"offset state must be a JSON object: {self.path}")
+        return value
 
     @staticmethod
     def _target_state(value: Any) -> dict[str, Any]:
@@ -261,7 +268,13 @@ class OffsetStore:
             for key, value in requests.items()
             if isinstance(value, dict) and value.get("status") == "completed" and key not in pending_request_ids
         ]
-        completed.sort(key=lambda pair: float(pair[1].get("updatedAt", 0)))
+        def updated_at(pair: tuple[str, Any]) -> float:
+            try:
+                return float(pair[1].get("updatedAt", 0))
+            except (TypeError, ValueError):
+                return 0.0
+
+        completed.sort(key=updated_at)
         drop = max(0, len(requests) - MAX_REQUESTS)
         # Only evict as many as are actually evictable; do not fall through
         # to pending entries when pendingReplies pins the history.
