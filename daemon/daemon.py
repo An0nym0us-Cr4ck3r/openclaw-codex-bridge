@@ -247,40 +247,40 @@ class Daemon:
 
     async def _pick_thread(self) -> str | None:
         res = await self.ws.request("thread/list", {})
-        threads = res.get("data") or []
+        raw_threads = res.get("data") or []
+        if not isinstance(raw_threads, list):
+            return None
         # Prefer smallest legacy thread (fewest turns) that is not systemError, to avoid the 16384 item chain.
         # Score by recency within the smallest-turn bucket.
-        legacy = [t for t in threads if t.get("historyMode") == "legacy"]
+        legacy = [t for t in raw_threads if isinstance(t, dict) and t.get("historyMode") == "legacy"]
         best: str | None = None
         best_turns: int | None = None
         best_recency: int = -1
         for t in legacy:
+            thread_id = t.get("id")
+            if not isinstance(thread_id, str) or not thread_id:
+                continue
             st = (t.get("status") or {}).get("type")
             if st == "systemError":
                 continue
             try:
-                info = await self.ws.thread_read(t["id"])
+                info = await self.ws.thread_read(thread_id)
                 n = len(((info.get("thread") or {}).get("turns")) or [])
             except Exception:
                 continue
-            rec = int(t.get("recencyAt") or t.get("createdAt") or 0)
+            try:
+                rec = int(t.get("recencyAt") or t.get("createdAt") or 0)
+            except (TypeError, ValueError):
+                rec = 0
             if best_turns is None or n < best_turns or (n == best_turns and rec > best_recency):
                 best_turns = n
                 best_recency = rec
-                best = t["id"]
+                best = thread_id
         if best is not None:
             return best
-        # Fallback: any non-systemError legacy newest
-        for t in sorted(legacy, key=lambda x: int(x.get("recencyAt") or 0), reverse=True):
-            if (t.get("status") or {}).get("type") != "systemError":
-                return t["id"]
-        # Last resort: fork the newest healthy legacy thread.  Forking a
-        # systemError thread reproduces the oversized/broken history and is
-        # worse than returning no candidate.
-        candidates = [t for t in legacy if (t.get("status") or {}).get("type") != "systemError"]
-        if candidates:
-            newest = sorted(candidates, key=lambda x: int(x.get("recencyAt") or 0), reverse=True)[0]
-            return await self.ws.thread_fork(newest["id"])
+        # Do not select or fork a candidate that could not be verified with
+        # thread/read.  A stale thread/list status is not enough to prove the
+        # thread is usable, especially after a systemError chain.
         return None
 
     async def ensure_active_thread(self) -> str:
@@ -392,8 +392,6 @@ class Daemon:
             await self.ws.close()
         except Exception:
             pass
-        # reset WSClient state so _pending doesn't leak
-        self.ws._pending.clear()  # type: ignore[attr-defined]
         await self.ensure_ws()
 
     async def handle_submit(self, text: str, source: str, request_id: str) -> dict[str, Any]:
@@ -468,20 +466,6 @@ class Daemon:
         )
         return result
 
-    def _is_turn_active(self) -> bool:
-        """True while a Codex turn is certainly still running.
-
-        Only two signals are reliable here: the worker queue is non-empty and
-        the worker is holding an id in ``_active_request_ids``.  A
-        lastAttemptAt timestamp alone is not a live heartbeat, so it is not
-        used to keep entries alive — otherwise a crash without cleanup would
-        keep a dead entry for an hour.  Deceased entries are reaped by TTL;
-        live ones are protected by the two active signals above and by
-        deferring the whole sweep while a turn is active.
-        """
-
-        return bool(self._active_request_ids or self.queue.qsize() > 0)
-
     def _reap_with_active_guard(self) -> list[str]:
         """Reap stale entries, skipping requestIds whose turns are live.
 
@@ -500,12 +484,9 @@ class Daemon:
     async def stale_watchdog(self) -> None:
         """Periodically reap ``in_progress`` requests that never finished."""
 
-        # First sweep shortly after boot to surface the 17:33 stale entry that
-        # is still live as of this PR.  Afterwards sweep every five minutes.
-        # Guard: if a long turn (>600 s) is still active, defer the sweep so
-        # an in-flight turn is not misclassified as stale and reaped.  The
-        # TTL-based OffsetStore check alone has no live heartbeat, so the
-        # watchdog explicitly checks _is_turn_active() before reaping.
+        # First sweep shortly after boot to surface stale entries. Afterwards
+        # sweep every five minutes; active request IDs are protected by
+        # _reap_with_active_guard while unrelated stale entries are reaped.
         await asyncio.sleep(10)
         while True:
             try:
