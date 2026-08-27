@@ -29,6 +29,7 @@ TG_SINK = Path("/home/s0u7a/.local/bin/codex-tg-send")
 MIKU_SESSION_KEY = "agent:miku:telegram:direct:7536160870"
 TELEGRAM_TARGET = "7536160870"
 OPENCLAW_BIN = Path("/home/s0u7a/.local/bin/openclaw")
+MAX_UDS_LINE_BYTES = 256 * 1024
 
 
 def log(msg: str) -> None:
@@ -559,10 +560,25 @@ class Daemon:
             try:
                 method = req.get("method")
                 params = req.get("params") or {}
+                if not isinstance(params, dict):
+                    fut.set_result({"error": {"code": -32602, "message": "params must be an object"}})
+                    continue
                 if method == "submit":
-                    text = str(params.get("text") or "")
-                    source = str(params.get("source") or "unknown")
-                    request_id = str(params.get("requestId") or f"anonymous:{uuid.uuid4().hex}")
+                    text_value = params.get("text")
+                    source_value = params.get("source")
+                    request_id_value = params.get("requestId")
+                    if not isinstance(text_value, str):
+                        fut.set_result({"error": {"code": -32602, "message": "text must be a string"}})
+                        continue
+                    if source_value is not None and not isinstance(source_value, str):
+                        fut.set_result({"error": {"code": -32602, "message": "source must be a string"}})
+                        continue
+                    if request_id_value is not None and not isinstance(request_id_value, str):
+                        fut.set_result({"error": {"code": -32602, "message": "requestId must be a string"}})
+                        continue
+                    text = text_value
+                    source = source_value or "unknown"
+                    request_id = request_id_value or f"anonymous:{uuid.uuid4().hex}"
                     if len(request_id) > 256:
                         fut.set_result({"error": {"code": -32602, "message": "requestId too long"}})
                         continue
@@ -592,7 +608,12 @@ class Daemon:
     async def handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             while True:
-                line = await reader.readline()
+                try:
+                    line = await reader.readline()
+                except asyncio.LimitOverrunError:
+                    writer.write((json.dumps({"error": {"code": -32600, "message": "request line too long"}}) + "\n").encode())
+                    await writer.drain()
+                    break
                 if not line:
                     break
                 line = line.strip()
@@ -604,8 +625,20 @@ class Daemon:
                     writer.write((json.dumps({"error": {"code": -32700, "message": f"parse error: {e}"}}) + "\n").encode())
                     await writer.drain()
                     continue
+                if not isinstance(req, dict) or not isinstance(req.get("method"), str):
+                    writer.write((json.dumps({"error": {"code": -32600, "message": "invalid request"}}) + "\n").encode())
+                    await writer.drain()
+                    continue
                 rid = req.get("id")
                 method = req.get("method")
+                params = req.get("params")
+                if params is not None and not isinstance(params, dict):
+                    out: dict[str, Any] = {"error": {"code": -32602, "message": "params must be an object"}}
+                    if isinstance(rid, (str, int)) and not isinstance(rid, bool):
+                        out["id"] = rid
+                    writer.write((json.dumps(out, ensure_ascii=False) + "\n").encode())
+                    await writer.drain()
+                    continue
                 if method == "ping":
                     out = {"result": {"ok": True, "activeThreadId": self.store.active_thread_id}}
                     if rid is not None:
@@ -664,7 +697,7 @@ class Daemon:
         self._stale_task = asyncio.create_task(self.stale_watchdog())
         await self.ensure_ws()
         self._worker_task = asyncio.create_task(self.worker())
-        self._server = await asyncio.start_unix_server(self.handle_client, path=str(self.uds))
+        self._server = await asyncio.start_unix_server(self.handle_client, path=str(self.uds), limit=MAX_UDS_LINE_BYTES)
         # restrict to owner only (0700 dir already, but be explicit)
         try:
             os.chmod(self.uds, 0o700)

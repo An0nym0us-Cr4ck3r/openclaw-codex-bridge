@@ -57,6 +57,7 @@ async def exercise() -> None:
         instance.ws = FakeWS()
         instance._ws_connected = True
         instance._fanout_task = asyncio.create_task(instance.fanout_worker())
+        instance._worker_task = asyncio.create_task(instance.worker())
         try:
             with patch.object(bridge, "deliver_telegram", return_value=True) as telegram, patch.object(bridge, "deliver_miku", return_value=True) as miku:
                 first = await instance.handle_submit("hello", "miku", "stable-request")
@@ -81,6 +82,13 @@ async def exercise() -> None:
                 status = json.loads((await reader.readline()).decode())
                 assert ping["result"]["ok"] is True
                 assert status["result"]["activeThreadId"] == "thread-1"
+                writer.write(b"[]\n{\"id\":3,\"method\":\"submit\",\"params\":{\"text\":7}}\n")
+                await writer.drain()
+                invalid_request = json.loads((await reader.readline()).decode())
+                invalid_params = json.loads((await reader.readline()).decode())
+                assert invalid_request["error"]["code"] == -32600
+                assert invalid_params["id"] == 3
+                assert invalid_params["error"]["code"] == -32602
                 writer.close()
                 await writer.wait_closed()
             finally:
@@ -90,6 +98,11 @@ async def exercise() -> None:
             instance._fanout_task.cancel()
             try:
                 await instance._fanout_task
+            except asyncio.CancelledError:
+                pass
+            instance._worker_task.cancel()
+            try:
+                await instance._worker_task
             except asyncio.CancelledError:
                 pass
 
