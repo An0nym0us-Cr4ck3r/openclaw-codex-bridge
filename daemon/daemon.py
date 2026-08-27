@@ -261,19 +261,16 @@ class Daemon:
             thread_id = t.get("id")
             if not isinstance(thread_id, str) or not thread_id:
                 continue
-            st = (t.get("status") or {}).get("type")
+            status = t.get("status")
+            st = status.get("type") if isinstance(status, dict) else None
             if st == "systemError":
                 continue
             try:
                 info = await self.ws.thread_read(thread_id)
-                info_thread = info.get("thread") or {}
-                if (info_thread.get("status") or {}).get("type") == "systemError":
+                stats = self._healthy_thread_stats(info)
+                if stats is None:
                     continue
-                info_turns = info_thread.get("turns") or []
-                n = len(info_turns)
-                item_count = sum(len(turn.get("items") or []) for turn in info_turns if isinstance(turn, dict))
-                if n >= self.store.limit_turns or item_count >= self.store.limit_items:
-                    continue
+                _, item_count, n = stats
             except Exception:
                 continue
             try:
@@ -291,6 +288,41 @@ class Daemon:
         # thread is usable, especially after a systemError chain.
         return None
 
+    @staticmethod
+    def _thread_stats(info: Any) -> tuple[str | None, int, int] | None:
+        if not isinstance(info, dict):
+            return None
+        thread = info.get("thread")
+        if not isinstance(thread, dict):
+            return None
+        status = thread.get("status")
+        status_type = status.get("type") if isinstance(status, dict) else None
+        turns = thread.get("turns") or []
+        if not isinstance(turns, list):
+            return None
+        item_count = 0
+        for turn in turns:
+            if not isinstance(turn, dict):
+                return None
+            items = turn.get("items") or []
+            if not isinstance(items, list):
+                return None
+            item_count += len(items)
+        return status_type, item_count, len(turns)
+
+    def _healthy_thread_stats(self, info: Any) -> tuple[str | None, int, int] | None:
+        stats = self._thread_stats(info)
+        if stats is None:
+            return None
+        status_type, item_count, turn_count = stats
+        if self.store.needs_rotation(
+            status_type=status_type,
+            item_count=item_count,
+            turn_count=turn_count,
+        ):
+            return None
+        return stats
+
     async def ensure_active_thread(self) -> str:
         tid = self.store.active_thread_id
         if tid is None:
@@ -301,11 +333,10 @@ class Daemon:
             tid = found
         try:
             info = await self.ws.thread_read(tid)
-            thread = info.get("thread") or {}
-            status_type = (thread.get("status") or {}).get("type")
-            turns = thread.get("turns") or []
-            item_count = sum(len(t.get("items") or []) for t in turns)
-            turn_count = len(turns)
+            stats = self._thread_stats(info)
+            if stats is None:
+                raise AppServerError(f"thread/read returned invalid data for {tid}")
+            status_type, item_count, turn_count = stats
             self.store.record_usage(item_count, turn_count)
             self.verification.append(
                 "thread.usage",
@@ -333,8 +364,8 @@ class Daemon:
                 found = await self._pick_thread()
                 if found and found != tid:
                     chk = await self.ws.thread_read(found)
-                    if (chk.get("thread") or {}).get("status", {}).get("type") != "systemError":
-                        self.store.set_active(found, forked_from=tid)
+                    if self._healthy_thread_stats(chk) is not None:
+                        self.store.set_active(found)
                         self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=found, reason=status_type or "limit")
                         log(f"rotated {tid} -> picked fresh {found}")
                         return found
@@ -348,8 +379,8 @@ class Daemon:
                     found = await self._pick_thread()
                     if found and found != tid:
                         chk = await self.ws.thread_read(found)
-                        if (chk.get("thread") or {}).get("status", {}).get("type") != "systemError":
-                            self.store.set_active(found, forked_from=tid)
+                        if self._healthy_thread_stats(chk) is not None:
+                            self.store.set_active(found)
                             self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=found, reason="systemError")
                             return found
                     raise AppServerError(f"systemError on {tid} and no healthy alternative thread")
@@ -359,17 +390,22 @@ class Daemon:
             try:
                 new_id = await self.ws.thread_fork(tid)
                 child_info = await self.ws.thread_read(new_id)
-                child_status = (child_info.get("thread") or {}).get("status", {}).get("type")
-                if child_status == "systemError":
-                    log(f"forked child {new_id} is still systemError — discarding, picking fresh")
+                child_stats = self._healthy_thread_stats(child_info)
+                if child_stats is None:
+                    log(f"forked child {new_id} failed health check — discarding, picking fresh")
+                    raw_child_stats = self._thread_stats(child_info)
+                    child_reason = raw_child_stats[0] if raw_child_stats and raw_child_stats[0] else "health check"
                     found = await self._pick_thread()
                     if found and found not in {tid, new_id}:
                         found_info = await self.ws.thread_read(found)
-                        if (found_info.get("thread") or {}).get("status", {}).get("type") != "systemError":
-                            self.store.set_active(found, forked_from=tid)
+                        if self._healthy_thread_stats(found_info) is not None:
+                            self.store.set_active(found)
                             self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=found, reason="limit-fallback")
                             return found
-                    raise AppServerError(f"forked child {new_id} is systemError and no healthy thread is available")
+                    raise AppServerError(
+                        f"forked child {new_id} failed health check ({child_reason}) "
+                        "and no healthy thread is available"
+                    )
                 self.store.set_active(new_id, forked_from=tid)
                 self.verification.append("thread.rotated", fromThreadId=tid, toThreadId=new_id, reason="limit")
                 log(f"forked {tid} -> {new_id}")

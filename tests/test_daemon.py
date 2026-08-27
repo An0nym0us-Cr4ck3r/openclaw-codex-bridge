@@ -63,6 +63,26 @@ class StaleThreadListWS:
         raise AssertionError(f"unexpected thread read: {thread_id}")
 
 
+class OversizedForkWS:
+    async def thread_read(self, thread_id: str):
+        if thread_id in {"old", "child"}:
+            return {
+                "thread": {
+                    "status": {"type": "idle"},
+                    "turns": [{"items": [{"id": str(i)} for i in range(5)]}],
+                }
+            }
+        raise AssertionError(f"unexpected thread read: {thread_id}")
+
+    async def request(self, method: str, params: dict):
+        assert method == "thread/list"
+        return {"data": []}
+
+    async def thread_fork(self, thread_id: str) -> str:
+        assert thread_id == "old"
+        return "child"
+
+
 def test_detailed_delivery_failure_is_not_truthy_success() -> None:
     assert bridge.normalize_delivery_result((False, "openclaw failed")) == (False, "openclaw failed")
     assert bridge.normalize_delivery_result((True, "")) == (True, "")
@@ -117,6 +137,27 @@ async def test_uds_cleanup_only_removes_stale_socket() -> None:
         )
         await stale_instance._prepare_uds()
         assert not stale.exists()
+
+
+async def test_oversized_fork_child_is_not_activated() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance = bridge.Daemon(
+            root / "bridge.sock",
+            root / "thread-state.json",
+            root / "offset.json",
+            root / "verification.jsonl",
+            limit_items=5,
+        )
+        instance.store.set_active("old")
+        instance.ws = OversizedForkWS()
+        try:
+            await instance.ensure_active_thread()
+        except bridge.AppServerError as exc:
+            assert "failed health check" in str(exc)
+        else:
+            raise AssertionError("oversized fork child was accepted")
+        assert instance.store.active_thread_id == "old"
 
 
 async def exercise_partial_fanout() -> None:
@@ -219,6 +260,7 @@ def main() -> None:
     asyncio.run(exercise())
     asyncio.run(test_thread_picker_verifies_live_status_and_limits())
     asyncio.run(test_uds_cleanup_only_removes_stale_socket())
+    asyncio.run(test_oversized_fork_child_is_not_activated())
     asyncio.run(exercise_partial_fanout())
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
