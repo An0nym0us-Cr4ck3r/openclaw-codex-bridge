@@ -23,17 +23,15 @@ class WSClient:
         self._buf = b""
         self._next_id = 1
         self._recv_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()
         # pending request futures keyed by id
         self._pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._bg_task: asyncio.Task[None] | None = None
+        self._event_q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def connect(self) -> None:
-        if self.writer is not None:
-            try:
-                self.writer.close()
-                await self.writer.wait_closed()
-            except Exception:
-                pass
+        if self.writer is not None or self._bg_task is not None:
+            await self.close()
         self.reader, self.writer = await asyncio.open_unix_connection(self.socket_path)
         key = base64.b64encode(os.urandom(16)).decode()
         handshake = (
@@ -60,21 +58,30 @@ class WSClient:
         await self._send_obj({"method": "initialized", "params": {}})
 
     async def close(self) -> None:
-        if self._bg_task is not None:
-            self._bg_task.cancel()
+        task = self._bg_task
+        self._bg_task = None
+        if task is not None:
+            task.cancel()
             try:
-                await self._bg_task
+                await task
             except asyncio.CancelledError:
                 pass
-            self._bg_task = None
-        if self.writer is not None:
-            try:
-                self.writer.close()
-                await self.writer.wait_closed()
-            except Exception:
-                pass
+        close_error = AppServerError("connection closed")
+        for fut in list(self._pending.values()):
+            if not fut.done():
+                fut.set_exception(close_error)
+        self._pending.clear()
+        self._drain_events()
+        writer = self.writer
         self.writer = None
         self.reader = None
+        self._buf = b""
+        if writer is not None:
+            try:
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                pass
 
     # ---- low-level WS framing ----
 
@@ -94,18 +101,21 @@ class WSClient:
         return bytes(out)
 
     async def _send_frame(self, opcode: int, payload: bytes) -> None:
-        assert self.writer is not None
-        mask = os.urandom(4)
-        size = len(payload)
-        if size < 126:
-            header = bytes([0x80 | opcode, 0x80 | size])
-        elif size < 65536:
-            header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", size)
-        else:
-            header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack(">Q", size)
-        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        self.writer.write(header + mask + masked)
-        await self.writer.drain()
+        async with self._send_lock:
+            writer = self.writer
+            if writer is None:
+                raise AppServerError("not connected")
+            mask = os.urandom(4)
+            size = len(payload)
+            if size < 126:
+                header = bytes([0x80 | opcode, 0x80 | size])
+            elif size < 65536:
+                header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", size)
+            else:
+                header = bytes([0x80 | opcode, 0x80 | 127]) + struct.pack(">Q", size)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            writer.write(header + mask + masked)
+            await writer.drain()
 
     async def _send_obj(self, obj: dict[str, Any]) -> None:
         await self._send_frame(0x1, json.dumps(obj, ensure_ascii=False, separators=(",", ":")).encode())
@@ -158,11 +168,38 @@ class WSClient:
             except Exception:
                 pass
 
-    _event_q: asyncio.Queue[dict[str, Any]]  # set in __init__-like place
-
     def _ensure_event_q(self) -> None:
-        if not hasattr(self, "_event_q"):
-            self._event_q = asyncio.Queue()
+        # Kept as a compatibility no-op for callers from the initial bridge.
+        # The queue is created in __init__, so reconnects never replace it
+        # while another coroutine is waiting on the same queue.
+        return
+
+    def _drain_events(self) -> None:
+        while True:
+            try:
+                self._event_q.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+    @staticmethod
+    def _event_turn_id(msg: dict[str, Any]) -> str | None:
+        params = msg.get("params") or {}
+        if not isinstance(params, dict):
+            return None
+        for key in ("turnId", "turn_id"):
+            value = params.get(key)
+            if value is not None:
+                return str(value)
+        turn = params.get("turn")
+        if isinstance(turn, dict) and turn.get("id") is not None:
+            return str(turn["id"])
+        item = params.get("item")
+        if isinstance(item, dict):
+            for key in ("turnId", "turn_id"):
+                value = item.get(key)
+                if value is not None:
+                    return str(value)
+        return None
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_event_q()
@@ -170,7 +207,11 @@ class WSClient:
         self._next_id += 1
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[rid] = fut
-        await self._send_obj({"id": rid, "method": method, "params": params})
+        try:
+            await self._send_obj({"id": rid, "method": method, "params": params})
+        except Exception:
+            self._pending.pop(rid, None)
+            raise
         return await fut
 
     async def ensure_thread_resumed(self, thread_id: str) -> None:
@@ -204,16 +245,25 @@ class WSClient:
             if t.get("status") in {"inProgress", "pending", "started", "running"}:
                 active = t.get("id")
                 break
-        rid = self._next_id
-        self._next_id += 1
+        # Requests such as thread/read can leave unsolicited notifications in
+        # the shared queue.  They belong to the previous operation and must
+        # not be interpreted as output for this turn.
+        self._drain_events()
         if active:
-            await self._send_obj({"id": rid, "method": "turn/steer", "params": {"threadId": thread_id, "input": [{"type": "text", "text": text}], "expectedTurnId": active}})
+            start_result = await self.request(
+                "turn/steer",
+                {"threadId": thread_id, "input": [{"type": "text", "text": text}], "expectedTurnId": active},
+            )
             expected = active
         else:
-            await self._send_obj({"id": rid, "method": "turn/start", "params": {"threadId": thread_id, "input": [{"type": "text", "text": text}]}})
+            start_result = await self.request(
+                "turn/start",
+                {"threadId": thread_id, "input": [{"type": "text", "text": text }]},
+            )
             expected = None
 
-        turn_id: str | None = expected
+        started_turn = start_result.get("turn") or {}
+        turn_id: str | None = str(started_turn["id"]) if isinstance(started_turn, dict) and started_turn.get("id") else expected
         output: list[str] = []
 
         # helper to extract text from content
@@ -233,15 +283,13 @@ class WSClient:
             msg = await self._event_q.get()
             if "_error" in msg:
                 raise AppServerError(str(msg["_error"]))
-            if msg.get("id") == rid:
-                if "error" in msg:
-                    raise AppServerError(f"turn: {msg['error']}")
-                turn = (msg.get("result") or {}).get("turn") or {}
-                if turn.get("id"):
-                    turn_id = turn["id"]
-                continue
             method = msg.get("method", "")
             params = msg.get("params") or {}
+            event_turn_id = self._event_turn_id(msg)
+            if event_turn_id is not None and turn_id is not None and event_turn_id != str(turn_id):
+                continue
+            if event_turn_id is not None and turn_id is None:
+                turn_id = event_turn_id
             if method == "item/agentMessage/delta":
                 delta = params.get("delta") or params.get("text") or ""
                 if isinstance(delta, str):
@@ -255,5 +303,5 @@ class WSClient:
             elif method == "turn/completed":
                 completed = params.get("turn") or {}
                 cid = completed.get("id") or params.get("turnId")
-                if turn_id is None or cid in {None, turn_id}:
+                if turn_id is None or cid in {None, turn_id, str(turn_id)}:
                     return ("".join(output).strip(), turn_id or "")
