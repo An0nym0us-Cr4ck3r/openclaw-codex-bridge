@@ -90,6 +90,28 @@ def test_legacy_pending_migration() -> None:
         assert json.loads(path.read_text(encoding="utf-8"))["version"] == 2
 
 
+def test_current_empty_outbox_does_not_remigrate_compatibility_mirror() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "offset.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "delivered": [],
+                    "pending": [{"reply": "already-delivered", "threadId": "t", "ts": 1}],
+                    "pendingReplies": [],
+                    "completedDeliveries": [],
+                    "requests": {},
+                }
+            ),
+            encoding="utf-8",
+        )
+        store = OffsetStore(path)
+        assert store.pending_replies() == []
+        store.save()
+        assert json.loads(path.read_text(encoding="utf-8"))["pending"] == []
+
+
 def test_corrupt_state_fails_closed() -> None:
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory) / "offset.json"
@@ -175,6 +197,7 @@ def main() -> None:
     test_retry_backoff_and_conflict()
     test_target_chunk_progress_is_durable()
     test_legacy_pending_migration()
+    test_current_empty_outbox_does_not_remigrate_compatibility_mirror()
     test_corrupt_state_fails_closed()
     test_trim_tolerates_invalid_timestamps()
     test_stale_in_progress_reap()

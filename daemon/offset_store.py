@@ -192,7 +192,9 @@ class OffsetStore:
             self.data["requests"] = {}
             changed = True
 
-        pending_replies = self.data.get("pendingReplies")
+        pending_replies_value = self.data.get("pendingReplies")
+        pending_replies_was_valid = isinstance(pending_replies_value, list)
+        pending_replies = pending_replies_value
         if not isinstance(pending_replies, list):
             pending_replies = []
             self.data["pendingReplies"] = pending_replies
@@ -202,7 +204,11 @@ class OffsetStore:
         # per-target state.  Convert them once; version 2 writes ``pending``
         # only as a compatibility mirror and must not be converted again.
         legacy_pending = self.data.get("pending")
-        if self.data.get("version") == SCHEMA_VERSION and not pending_replies and isinstance(legacy_pending, list):
+        if (
+            self.data.get("version") == SCHEMA_VERSION
+            and not pending_replies_was_valid
+            and isinstance(legacy_pending, list)
+        ):
             for item in legacy_pending:
                 if not isinstance(item, dict) or not isinstance(item.get("reply"), str):
                     continue
