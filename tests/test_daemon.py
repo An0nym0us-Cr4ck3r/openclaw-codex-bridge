@@ -44,6 +44,12 @@ class BrokenForkWS:
         return "child"
 
 
+def test_detailed_delivery_failure_is_not_truthy_success() -> None:
+    assert bridge.normalize_delivery_result((False, "openclaw failed")) == (False, "openclaw failed")
+    assert bridge.normalize_delivery_result((True, "")) == (True, "")
+    assert bridge.normalize_delivery_result(False) == (False, "delivery returned false")
+
+
 async def exercise() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

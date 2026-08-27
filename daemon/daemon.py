@@ -87,16 +87,26 @@ def deliver_telegram(text: str) -> bool:
     return delivered
 
 
-def deliver_miku(text: str) -> bool:
-    """Deliver to Miku with a hard process bound.
+def _daemon_env() -> dict[str, str]:
+    """Env for subprocesses: systemd PATH fix must be inherited."""
+    env = os.environ.copy()
+    # Ensure openclaw is found even when systemd PATH was incomplete.
+    extra = "/home/s0u7a/.local/bin:/home/s0u7a/.cargo/bin"
+    cur = env.get("PATH", "")
+    if extra not in cur:
+        env["PATH"] = f"{extra}:{cur}" if cur else extra
+    env.setdefault("HOME", str(Path.home()))
+    env.setdefault("XDG_RUNTIME_DIR", "/run/user/1000")
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
 
-    This function is called through ``asyncio.to_thread`` by the daemon's
-    fanout worker, so waiting here does not block UDS request handling.
-    """
+
+def deliver_miku(text: str) -> tuple[bool, str]:
+    """Deliver to Miku with a hard process bound. Returns (ok, error_detail)."""
 
     text = redact(text).strip()[:12000]
     if not text:
-        return True
+        return True, ""
     cmd = [
         str(OPENCLAW_BIN),
         "agent",
@@ -110,34 +120,58 @@ def deliver_miku(text: str) -> bool:
         "--thinking",
         "off",
         "--timeout",
-        "60",
+        "45",
         "--message",
         f"Codex: {text}",
     ]
+    # Outer timeout must be longer than inner --timeout (45).
+    outer = ["timeout", "--kill-after=5", "65"] + cmd
     try:
         try:
             result = subprocess.run(
-                ["timeout", "--kill-after=5", "45"] + cmd,
+                outer,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 check=False,
                 start_new_session=True,
+                env=_daemon_env(),
+                timeout=70,
             )
-            return result.returncode == 0
         except FileNotFoundError:
             result = subprocess.run(
                 cmd,
                 stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=45,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 check=False,
                 start_new_session=True,
+                env=_daemon_env(),
+                timeout=55,
             )
-            return result.returncode == 0
-    except Exception:
-        return False
+        if result.returncode == 0:
+            return True, ""
+        err = (result.stderr or b"").decode(errors="replace").strip()
+        out = (result.stdout or b"").decode(errors="replace").strip()
+        detail = err or out or f"exit {result.returncode}"
+        # Keep it short and secret-free.
+        detail = redact(detail)[:400]
+        return False, detail
+    except subprocess.TimeoutExpired as e:
+        detail = (e.stderr or b"").decode(errors="replace")[:300] if getattr(e, "stderr", None) else "timeout"
+        return False, redact(detail)[:400]
+    except Exception as e:
+        return False, redact(f"{type(e).__name__}: {e}")[:400]
+
+
+def normalize_delivery_result(value: Any) -> tuple[bool, str]:
+    """Accept legacy bool and detailed ``(ok, error)`` delivery results."""
+
+    if isinstance(value, tuple) and len(value) == 2:
+        delivered, detail = value
+        return bool(delivered), str(detail)[:400]
+    delivered = bool(value)
+    return delivered, "" if delivered else "delivery returned false"
 
 
 class Daemon:
@@ -496,13 +530,13 @@ class Daemon:
                     did_work = True
                     try:
                         if target == "telegram":
-                            delivered = await asyncio.to_thread(deliver_telegram, reply)
+                            delivery_result = await asyncio.to_thread(deliver_telegram, reply)
                         else:
-                            delivered = await asyncio.to_thread(deliver_miku, reply)
-                        error = "delivery returned non-zero status"
+                            delivery_result = await asyncio.to_thread(deliver_miku, reply)
+                        delivered, error = normalize_delivery_result(delivery_result)
                     except Exception as exc:
                         delivered = False
-                        error = f"{type(exc).__name__}: {exc}"
+                        error = redact(f"{type(exc).__name__}: {exc}")[:400]
                     if delivered:
                         self.offset.mark_target_delivered(delivery_id, target)
                         self.verification.append(
