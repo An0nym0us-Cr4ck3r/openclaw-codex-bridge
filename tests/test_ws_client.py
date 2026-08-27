@@ -62,6 +62,46 @@ async def test_dead_receive_task_is_not_reused() -> None:
         raise AssertionError("completed receive task was reused")
 
 
+async def test_cancelled_request_is_removed_from_pending() -> None:
+    client = WSClient("unused")
+    client.writer = object()  # type: ignore[assignment]
+    client._bg_task = asyncio.create_task(asyncio.sleep(60))
+
+    async def fake_send(_obj: dict) -> None:
+        return
+
+    client._send_obj = fake_send  # type: ignore[method-assign]
+    try:
+        try:
+            await asyncio.wait_for(client.request("status", {}), timeout=0.01)
+        except asyncio.TimeoutError:
+            pass
+        else:
+            raise AssertionError("request unexpectedly completed")
+        assert client._pending == {}
+    finally:
+        client._bg_task.cancel()
+        try:
+            await client._bg_task
+        except asyncio.CancelledError:
+            pass
+
+
+async def test_bounded_control_request_surfaces_timeout() -> None:
+    client = WSClient("unused")
+
+    async def never_returns(_method: str, _params: dict):
+        await asyncio.Event().wait()
+
+    client.request = never_returns  # type: ignore[method-assign]
+    try:
+        await client._request_bounded("thread/read", {}, timeout=0.01)
+    except AppServerError as exc:
+        assert "thread/read timed out" in str(exc)
+    else:
+        raise AssertionError("bounded request unexpectedly completed")
+
+
 async def test_terminal_error_notification_is_not_ignored() -> None:
     client = WSClient("unused")
 
@@ -120,6 +160,8 @@ def main() -> None:
     asyncio.run(test_turn_events_are_scoped_to_the_current_turn())
     asyncio.run(test_close_fails_pending_requests_and_discards_events())
     asyncio.run(test_dead_receive_task_is_not_reused())
+    asyncio.run(test_cancelled_request_is_removed_from_pending())
+    asyncio.run(test_bounded_control_request_surfaces_timeout())
     asyncio.run(test_terminal_error_notification_is_not_ignored())
     asyncio.run(test_idle_timeout_interrupts_the_active_turn())
     print("PASS ws_client")

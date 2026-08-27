@@ -14,6 +14,7 @@ class AppServerError(RuntimeError):
 
 
 TURN_IDLE_TIMEOUT_SECONDS = 300.0
+CONTROL_REQUEST_TIMEOUT_SECONDS = 60.0
 
 
 class WSClient:
@@ -261,23 +262,45 @@ class WSClient:
         except Exception:
             self._pending.pop(rid, None)
             raise
-        return await fut
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            # A bounded caller (or a disconnected UDS client) may cancel the
+            # wait while app-server is still working on the request.  Do not
+            # leave a dead future in the pending map for a later reconnect.
+            if self._pending.get(rid) is fut:
+                self._pending.pop(rid, None)
+            if not fut.done():
+                fut.cancel()
+            raise
+
+    async def _request_bounded(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        timeout: float = CONTROL_REQUEST_TIMEOUT_SECONDS,
+    ) -> dict[str, Any]:
+        try:
+            return await asyncio.wait_for(self.request(method, params), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            raise AppServerError(f"{method} timed out after {timeout:.1f}s") from exc
 
     async def ensure_thread_resumed(self, thread_id: str) -> None:
-        await self.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+        await self._request_bounded("thread/resume", {"threadId": thread_id, "excludeTurns": True})
 
     async def thread_read(self, thread_id: str) -> dict[str, Any]:
-        return await self.request("thread/read", {"threadId": thread_id, "includeTurns": True})
+        return await self._request_bounded("thread/read", {"threadId": thread_id, "includeTurns": True})
 
     async def thread_fork(self, thread_id: str) -> str:
-        res = await self.request("thread/fork", {"threadId": thread_id})
+        res = await self._request_bounded("thread/fork", {"threadId": thread_id})
         new_id = ((res.get("thread") or {}).get("id")) or res.get("id") or ""
         if not new_id:
             raise AppServerError("fork returned no thread id")
         return str(new_id)
 
     async def interrupt_turn(self, thread_id: str, turn_id: str) -> None:
-        await self.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+        await self._request_bounded("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
 
     async def _interrupt_best_effort(self, thread_id: str, turn_id: str) -> None:
         try:
@@ -317,13 +340,13 @@ class WSClient:
         # not be interpreted as output for this turn.
         self._drain_events()
         if active:
-            start_result = await self.request(
+            start_result = await self._request_bounded(
                 "turn/steer",
                 {"threadId": thread_id, "input": [{"type": "text", "text": text}], "expectedTurnId": active},
             )
             expected = active
         else:
-            start_result = await self.request(
+            start_result = await self._request_bounded(
                 "turn/start",
                 {"threadId": thread_id, "input": [{"type": "text", "text": text }]},
             )
