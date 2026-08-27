@@ -553,10 +553,32 @@ class Daemon:
         else:
             payload = text
         log(f"submit source={source} thread={tid} len={len(payload)}")
-        # run turn with reconnect retry once on any transport failure
+        # Retry only transport failures.  Application-level turn failures
+        # (provider errors and bounded timeouts) are terminal for this
+        # request; replaying the same input after a timeout can duplicate a
+        # turn and is especially harmful when the original UDS client has
+        # already disconnected.
         try:
             reply, turn_id = await self.ws.run_turn(tid, payload)
-        except (AppServerError, OSError, BrokenPipeError, ConnectionResetError) as e:
+        except AppServerError as e:
+            message = str(e).lower()
+            retryable = any(
+                marker in message
+                for marker in (
+                    "not connected",
+                    "socket closed",
+                    "connection closed",
+                    "handshake closed",
+                    "app-server sent close",
+                )
+            )
+            if not retryable:
+                raise
+            log(f"run_turn transport failure ({type(e).__name__}): {e} — reconnecting once")
+            await self._reconnect_ws()
+            tid = await self.ensure_active_thread()
+            reply, turn_id = await self.ws.run_turn(tid, payload)
+        except (OSError, BrokenPipeError, ConnectionResetError) as e:
             log(f"run_turn failed ({type(e).__name__}): {e} — reconnecting once")
             await self._reconnect_ws()
             tid = await self.ensure_active_thread()

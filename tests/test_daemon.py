@@ -23,6 +23,11 @@ class FakeWS:
         return ("stable reply", f"turn-{self.turns}")
 
 
+class TerminalErrorWS(FakeWS):
+    async def run_turn(self, thread_id: str, text: str):
+        raise bridge.AppServerError("turn total timeout")
+
+
 class UnmaterializedWS:
     def __init__(self) -> None:
         self.materialize_calls: list[tuple[str, str]] = []
@@ -131,6 +136,31 @@ async def test_unmaterialized_active_thread_is_materialized_in_place() -> None:
         instance.ws = UnmaterializedWS()
         assert await instance.ensure_active_thread() == "fresh"
         assert instance.ws.materialize_calls == [("fresh", "hello - materialize")]
+
+
+async def test_application_turn_error_is_not_retried() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance = bridge.Daemon(
+            root / "bridge.sock",
+            root / "thread-state.json",
+            root / "offset.json",
+            root / "verification.jsonl",
+        )
+        instance.store.set_active("thread-1")
+        instance.ws = TerminalErrorWS()
+        instance._ws_connected = True
+
+        async def unexpected_reconnect() -> None:
+            raise AssertionError("application turn error was retried")
+
+        instance._reconnect_ws = unexpected_reconnect  # type: ignore[method-assign]
+        try:
+            await instance.handle_submit("hello", "miku", "terminal-error")
+        except bridge.AppServerError as exc:
+            assert "total timeout" in str(exc)
+        else:
+            raise AssertionError("application turn error was swallowed")
 
 
 async def test_uds_cleanup_only_removes_stale_socket() -> None:
@@ -289,6 +319,7 @@ def main() -> None:
     asyncio.run(exercise())
     asyncio.run(test_thread_picker_verifies_live_status_and_limits())
     asyncio.run(test_unmaterialized_active_thread_is_materialized_in_place())
+    asyncio.run(test_application_turn_error_is_not_retried())
     asyncio.run(test_uds_cleanup_only_removes_stale_socket())
     asyncio.run(test_oversized_fork_child_is_not_activated())
     asyncio.run(exercise_partial_fanout())
