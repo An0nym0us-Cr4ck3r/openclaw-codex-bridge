@@ -30,6 +30,8 @@ MIKU_SESSION_KEY = "agent:miku:telegram:direct:7536160870"
 TELEGRAM_TARGET = "7536160870"
 OPENCLAW_BIN = Path("/home/s0u7a/.local/bin/openclaw")
 MAX_UDS_LINE_BYTES = 256 * 1024
+TELEGRAM_CHUNK_CHARS = 3500
+MIKU_CHUNK_CHARS = 12000
 
 
 def log(msg: str) -> None:
@@ -48,6 +50,8 @@ def redact(text: str) -> str:
 
 
 def chunk_text(text: str, limit: int):
+    if limit < 1:
+        raise ValueError("chunk limit must be positive")
     if len(text) <= limit:
         yield text
         return
@@ -69,7 +73,7 @@ def deliver_telegram(text: str) -> bool:
     if not text:
         return True
     delivered = True
-    for part in chunk_text(text, 3500):
+    for part in chunk_text(text, TELEGRAM_CHUNK_CHARS):
         try:
             result = subprocess.run(
                 [str(TG_SINK), part],
@@ -104,7 +108,9 @@ def _daemon_env() -> dict[str, str]:
 def deliver_miku(text: str) -> tuple[bool, str]:
     """Deliver to Miku with a hard process bound. Returns (ok, error_detail)."""
 
-    text = redact(text).strip()[:12000]
+    # The fanout worker splits long replies before calling this function.
+    # Do not silently truncate here: a truncated Codex answer is data loss.
+    text = redact(text).strip()
     if not text:
         return True, ""
     cmd = [
@@ -528,22 +534,45 @@ class Daemon:
                     if float(target_state.get("nextAttemptAt", 0)) > now:
                         continue
                     did_work = True
+                    safe_reply = redact(reply).strip()
+                    chunk_limit = TELEGRAM_CHUNK_CHARS if target == "telegram" else MIKU_CHUNK_CHARS
+                    chunks = list(chunk_text(safe_reply, chunk_limit))
+                    if not chunks:
+                        self.offset.mark_target_delivered(delivery_id, target)
+                        continue
+                    try:
+                        chunk_index = max(0, int(target_state.get("chunkIndex", 0)))
+                    except (TypeError, ValueError):
+                        chunk_index = 0
+                    if chunk_index >= len(chunks):
+                        error = f"invalid chunk progress {chunk_index}/{len(chunks)}"
+                        self.offset.mark_target_failed(delivery_id, target, error)
+                        continue
                     try:
                         if target == "telegram":
-                            delivery_result = await asyncio.to_thread(deliver_telegram, reply)
+                            delivery_result = await asyncio.to_thread(deliver_telegram, chunks[chunk_index])
                         else:
-                            delivery_result = await asyncio.to_thread(deliver_miku, reply)
+                            delivery_result = await asyncio.to_thread(deliver_miku, chunks[chunk_index])
                         delivered, error = normalize_delivery_result(delivery_result)
                     except Exception as exc:
                         delivered = False
                         error = redact(f"{type(exc).__name__}: {exc}")[:400]
                     if delivered:
-                        self.offset.mark_target_delivered(delivery_id, target)
+                        advanced = self.offset.mark_target_chunk_delivered(
+                            delivery_id,
+                            target,
+                            chunk_index,
+                            len(chunks),
+                        )
+                        if not advanced:
+                            continue
                         self.verification.append(
                             "fanout.delivered",
                             deliveryId=delivery_id,
                             target=target,
                             attempts=int(target_state.get("attempts", 0)) + 1,
+                            chunkIndex=chunk_index,
+                            chunkTotal=len(chunks),
                         )
                     else:
                         self.offset.mark_target_failed(delivery_id, target, error)

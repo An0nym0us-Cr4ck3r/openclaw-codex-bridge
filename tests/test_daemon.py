@@ -50,6 +50,39 @@ def test_detailed_delivery_failure_is_not_truthy_success() -> None:
     assert bridge.normalize_delivery_result(False) == (False, "delivery returned false")
 
 
+async def exercise_partial_fanout() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance = bridge.Daemon(
+            root / "bridge.sock",
+            root / "thread-state.json",
+            root / "offset.json",
+            root / "verification.jsonl",
+        )
+        delivery_id = instance.offset.enqueue_reply("x" * 4000, "thread", "turn", "request")
+        instance._fanout_task = asyncio.create_task(instance.fanout_worker())
+        try:
+            with patch.object(bridge, "deliver_telegram", side_effect=[True, False]) as telegram, patch.object(bridge, "deliver_miku", return_value=True):
+                instance._fanout_event.set()
+                for _ in range(100):
+                    item = instance.offset.get_delivery(delivery_id) or {}
+                    target = (item.get("targets") or {}).get("telegram") or {}
+                    if target.get("chunkIndex") == 1:
+                        break
+                    await asyncio.sleep(0.01)
+                item = instance.offset.get_delivery(delivery_id) or {}
+                target = (item.get("targets") or {}).get("telegram") or {}
+                assert telegram.call_count == 2
+                assert target.get("chunkIndex") == 1
+                assert target.get("delivered") is False
+        finally:
+            instance._fanout_task.cancel()
+            try:
+                await instance._fanout_task
+            except asyncio.CancelledError:
+                pass
+
+
 async def exercise() -> None:
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
@@ -115,6 +148,7 @@ async def exercise() -> None:
 
 def main() -> None:
     asyncio.run(exercise())
+    asyncio.run(exercise_partial_fanout())
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)
         instance = bridge.Daemon(
