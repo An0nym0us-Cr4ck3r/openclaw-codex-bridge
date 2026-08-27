@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import asyncio
 import json
+import socket
 import tempfile
 from pathlib import Path
 import sys
@@ -81,6 +82,41 @@ async def test_thread_picker_verifies_live_status_and_limits() -> None:
         )
         instance.ws = StaleThreadListWS()
         assert await instance._pick_thread() == "healthy"
+
+
+async def test_uds_cleanup_only_removes_stale_socket() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        regular = root / "bridge.sock"
+        regular.write_text("do not remove", encoding="utf-8")
+        instance = bridge.Daemon(
+            regular,
+            root / "thread-state.json",
+            root / "offset.json",
+            root / "verification.jsonl",
+        )
+        try:
+            await instance._prepare_uds()
+        except RuntimeError as exc:
+            assert "not a socket" in str(exc)
+        else:
+            raise AssertionError("non-socket UDS path was accepted")
+        assert regular.read_text(encoding="utf-8") == "do not remove"
+
+        stale = root / "stale.sock"
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(str(stale))
+        finally:
+            sock.close()
+        stale_instance = bridge.Daemon(
+            stale,
+            root / "thread-state-2.json",
+            root / "offset-2.json",
+            root / "verification-2.jsonl",
+        )
+        await stale_instance._prepare_uds()
+        assert not stale.exists()
 
 
 async def exercise_partial_fanout() -> None:
@@ -182,6 +218,7 @@ async def exercise() -> None:
 def main() -> None:
     asyncio.run(exercise())
     asyncio.run(test_thread_picker_verifies_live_status_and_limits())
+    asyncio.run(test_uds_cleanup_only_removes_stale_socket())
     asyncio.run(exercise_partial_fanout())
     with tempfile.TemporaryDirectory() as directory:
         root = Path(directory)

@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -729,20 +730,7 @@ class Daemon:
 
     async def run(self) -> None:
         self.verification.append("daemon.start", uds=str(self.uds))
-        # stale sock cleanup
-        if self.uds.exists():
-            # probe if live
-            try:
-                r, w = await asyncio.open_unix_connection(str(self.uds))
-                w.close()
-                await w.wait_closed()
-                log(f"UDS {self.uds} already owned — exiting")
-                sys.exit(1)
-            except (ConnectionRefusedError, FileNotFoundError, OSError):
-                try:
-                    self.uds.unlink()
-                except FileNotFoundError:
-                    pass
+        await self._prepare_uds()
         self.uds.parent.mkdir(parents=True, exist_ok=True)
         self._fanout_task = asyncio.create_task(self.fanout_worker())
         self._stale_task = asyncio.create_task(self.stale_watchdog())
@@ -757,6 +745,31 @@ class Daemon:
         log(f"UDS listening on {self.uds}")
         async with self._server:
             await self._server.serve_forever()
+
+    async def _prepare_uds(self) -> None:
+        """Reject unrelated paths and remove only a stale Unix socket."""
+
+        try:
+            entry = self.uds.lstat()
+        except FileNotFoundError:
+            return
+        if not stat.S_ISSOCK(entry.st_mode):
+            raise RuntimeError(f"UDS path exists and is not a socket: {self.uds}")
+        try:
+            _reader, writer = await asyncio.open_unix_connection(str(self.uds))
+        except (ConnectionRefusedError, FileNotFoundError):
+            try:
+                current = self.uds.lstat()
+            except FileNotFoundError:
+                return
+            if not stat.S_ISSOCK(current.st_mode):
+                raise RuntimeError(f"UDS path changed and is not a socket: {self.uds}")
+            self.uds.unlink()
+        else:
+            writer.close()
+            await writer.wait_closed()
+            log(f"UDS {self.uds} already owned — exiting")
+            raise SystemExit(1)
 
 
 def main() -> None:
