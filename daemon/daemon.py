@@ -106,6 +106,32 @@ def _daemon_env() -> dict[str, str]:
     return env
 
 
+def _strip_config_warnings(text: str) -> str:
+    """Remove the noisy searxng warning that would otherwise fill truncation."""
+    lines = text.splitlines()
+    # The openclaw TUI warning appears as a box with "Config warnings" and
+    # "searxng" / "@openclaw/searxng" inside.  Strip it so real errors survive.
+    kept: list[str] = []
+    skipping = False
+    for line in lines:
+        low = line.lower()
+        if "config warnings" in low or "searxng" in low:
+            # Skip the box border and the install hint lines.
+            skipping = True
+            continue
+        if skipping:
+            stripped = line.strip()
+            # Box borders or empty, or the plugin line.
+            if not stripped or stripped.startswith("│") or stripped.startswith("├") or stripped.startswith("╰"):
+                continue
+            # First non-box line ends the warning block.
+            skipping = False
+        kept.append(line)
+    cleaned = "\n".join(kept).strip()
+    # Fallback: if stripping wiped everything, keep original.
+    return cleaned if cleaned else text.strip()
+
+
 def deliver_miku(text: str) -> tuple[bool, str]:
     """Deliver to Miku with a hard process bound. Returns (ok, error_detail)."""
 
@@ -608,7 +634,7 @@ class Daemon:
                             deliveryId=delivery_id,
                             target=target,
                             attempts=int(updated_target.get("attempts", 0)),
-                            error=error[:200],
+                            error=_strip_config_warnings(error)[:400],
                         )
             if did_work:
                 continue
