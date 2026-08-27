@@ -23,6 +23,20 @@ class FakeWS:
         return ("stable reply", f"turn-{self.turns}")
 
 
+class UnmaterializedWS:
+    def __init__(self) -> None:
+        self.materialize_calls: list[tuple[str, str]] = []
+
+    async def thread_read(self, thread_id: str):
+        raise bridge.AppServerError(
+            f"thread {thread_id} is not materialized yet; includeTurns is unavailable"
+        )
+
+    async def run_turn(self, thread_id: str, text: str):
+        self.materialize_calls.append((thread_id, text))
+        return ("materialized", "turn-1")
+
+
 class BrokenForkWS:
     async def thread_read(self, thread_id: str):
         if thread_id == "old":
@@ -102,6 +116,21 @@ async def test_thread_picker_verifies_live_status_and_limits() -> None:
         )
         instance.ws = StaleThreadListWS()
         assert await instance._pick_thread() == "healthy"
+
+
+async def test_unmaterialized_active_thread_is_materialized_in_place() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        instance = bridge.Daemon(
+            root / "bridge.sock",
+            root / "thread-state.json",
+            root / "offset.json",
+            root / "verification.jsonl",
+        )
+        instance.store.set_active("fresh")
+        instance.ws = UnmaterializedWS()
+        assert await instance.ensure_active_thread() == "fresh"
+        assert instance.ws.materialize_calls == [("fresh", "hello - materialize")]
 
 
 async def test_uds_cleanup_only_removes_stale_socket() -> None:
@@ -259,6 +288,7 @@ async def exercise() -> None:
 def main() -> None:
     asyncio.run(exercise())
     asyncio.run(test_thread_picker_verifies_live_status_and_limits())
+    asyncio.run(test_unmaterialized_active_thread_is_materialized_in_place())
     asyncio.run(test_uds_cleanup_only_removes_stale_socket())
     asyncio.run(test_oversized_fork_child_is_not_activated())
     asyncio.run(exercise_partial_fanout())

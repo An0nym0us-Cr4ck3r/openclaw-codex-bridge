@@ -244,15 +244,28 @@ class Daemon:
                         log(f"resumed thread {tid}")
                     except Exception as e:
                         log(f"resume {tid} failed: {e} — will try fork/list")
-                        # try to pick a fresh thread
+                        # try to pick a fresh thread; fallback to thread/start if none healthy
                         try:
                             found = await self._pick_thread()
                             if found and found != tid:
                                 self.store.set_active(found)
                                 tid = found
                                 log(f"picked thread {tid}")
+                            else:
+                                if found is None:
+                                    log(f"no healthy thread from _pick_thread after resume failure for {tid} — creating fresh thread")
+                                else:
+                                    log(f"_pick_thread returned same tid {tid} — creating fresh thread")
+                                new_res = await self.ws.request("thread/start", {})
+                                new_id = ((new_res.get("thread") or {}).get("id")) or new_res.get("id") or new_res.get("threadId") or ""
+                                if isinstance(new_id, str) and new_id:
+                                    self.store.set_active(new_id)
+                                    tid = new_id
+                                    log(f"created fresh thread {new_id} after resume failure")
+                                else:
+                                    log(f"thread/start returned no id: {new_res!r}")
                         except Exception as e2:
-                            log(f"pick thread failed: {e2}")
+                            log(f"pick/create thread failed: {e2}")
                 else:
                     # no active thread — pick one
                     try:
@@ -260,6 +273,13 @@ class Daemon:
                         if found:
                             self.store.set_active(found)
                             log(f"picked initial thread {found}")
+                        else:
+                            log("no healthy thread for initial pick — creating fresh thread")
+                            new_res = await self.ws.request("thread/start", {})
+                            new_id = ((new_res.get("thread") or {}).get("id")) or new_res.get("id") or new_res.get("threadId") or ""
+                            if isinstance(new_id, str) and new_id:
+                                self.store.set_active(new_id)
+                                log(f"created initial thread {new_id}")
                     except Exception as e:
                         log(f"pick initial thread failed: {e}")
                 self._ws_connected = True
@@ -448,7 +468,36 @@ class Daemon:
                 except Exception as compact_error:
                     log(f"compact failed: {compact_error}")
                 raise
-        except AppServerError:
+        except AppServerError as e:
+            # Unmaterialized threads (thread/start without turn/start) raise
+            # "is not materialized yet; includeTurns is unavailable" on
+            # thread/read with includeTurns=True.  Rather than bubbling into
+            # the reconnect busy-loop in handle_submit, materialize or replace.
+            if "is not materialized yet" in str(e):
+                log(f"thread {tid} unmaterialized — attempting to materialize")
+                try:
+                    await self.ws.run_turn(tid, "hello - materialize")
+                    log(f"materialized thread {tid}")
+                    return tid
+                except Exception as mat_err:
+                    log(f"materialize {tid} failed: {mat_err} — trying _pick_thread / thread/start")
+                    try:
+                        found = await self._pick_thread()
+                        if found and found != tid:
+                            self.store.set_active(found)
+                            log(f"replaced unmaterialized {tid} with picked {found}")
+                            return found
+                    except Exception as pick_err:
+                        log(f"pick after materialize failure: {pick_err}")
+                    try:
+                        new_res = await self.ws.request("thread/start", {})
+                        new_id = ((new_res.get("thread") or {}).get("id")) or new_res.get("id") or new_res.get("threadId") or ""
+                        if isinstance(new_id, str) and new_id:
+                            self.store.set_active(new_id)
+                            log(f"created fresh thread {new_id} replacing unmaterialized {tid}")
+                            return new_id
+                    except Exception as start_err:
+                        log(f"thread/start fallback failed: {start_err}")
             raise
         except (OSError, BrokenPipeError, ConnectionResetError):
             raise
