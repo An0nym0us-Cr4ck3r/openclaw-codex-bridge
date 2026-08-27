@@ -1,0 +1,16 @@
+[Unit]
+Description=Telegram reader — JSONL tail to UDS submit (C' ver.2)
+After=codex-bridge.service
+Wants=codex-bridge.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/openclaw/workspaces/miku/openclaw-codex-bridge
+ExecStart=/usr/bin/python3 /opt/openclaw/workspaces/miku/openclaw-codex-bridge/clients/telegram_reader.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/home/s0u7a/.local/bin:/home/s0u7a/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+[Install]
+WantedBy=default.target
