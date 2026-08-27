@@ -162,6 +162,12 @@ class WSClient:
                 if not fut.done():
                     fut.set_exception(exc)
             self._pending.clear()
+            writer = self.writer
+            self.writer = None
+            self.reader = None
+            self._buf = b""
+            if writer is not None:
+                writer.close()
             # put error sentinel to event queue so run_turn can surface
             try:
                 await self._event_q.put({"_error": str(exc)})  # type: ignore[attr-defined]
@@ -203,6 +209,8 @@ class WSClient:
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         self._ensure_event_q()
+        if self.writer is None or self._bg_task is None or self._bg_task.done():
+            raise AppServerError("not connected")
         rid = self._next_id
         self._next_id += 1
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()

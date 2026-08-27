@@ -49,9 +49,23 @@ async def test_close_fails_pending_requests_and_discards_events() -> None:
     assert client._event_q.empty()
 
 
+async def test_dead_receive_task_is_not_reused() -> None:
+    client = WSClient("unused")
+    client.writer = object()  # type: ignore[assignment]
+    client._bg_task = asyncio.create_task(asyncio.sleep(0))
+    await client._bg_task
+    try:
+        await client.request("status", {})
+    except AppServerError as exc:
+        assert str(exc) == "not connected"
+    else:
+        raise AssertionError("completed receive task was reused")
+
+
 def main() -> None:
     asyncio.run(test_turn_events_are_scoped_to_the_current_turn())
     asyncio.run(test_close_fails_pending_requests_and_discards_events())
+    asyncio.run(test_dead_receive_task_is_not_reused())
     print("PASS ws_client")
 
 
